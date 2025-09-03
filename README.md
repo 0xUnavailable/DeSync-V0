@@ -1,91 +1,81 @@
-# goraft
+# DESYNC
 
-A minimal implementation of Raft in Go. [Demo video](https://www.youtube.com/watch?v=cIR8RoN2LDU).
+**Decentralized Sequencer Architecture for Layer 2 Rollups - Minimum Viable Product**
 
-This blog post [walks through the code](https://notes.eatonphil.com/2023-05-25-raft.html).
+DESYNC is a decentralized sequencer architecture for Layer 2 rollups, designed to eliminate centralized points of failure in transaction ordering. It uses a modified Raft-inspired consensus with rotating leadership, gossip protocols, and Proof of History (PoH) for secure, high-throughput transaction processing.
 
-NOT FOR PRODUCTION USE.
+## Overview
 
-Things that are missing:
+### Purpose
+Decentralize L2 sequencing to prevent:
+- Censorship attacks
+- Single points of failure
+- Centralized MEV extraction
 
-* Client serial identifier for each message (maybe the most obvious missing function/actual bug)
-  * Search for "session" in [Diego Ongaro's thesis](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf) for more details.
-* Snapshotting/checkpointing and associated state transfer
-* Configuration change protocol
-* Rigged up to Jepsen
-* Surely much else
+### Mechanism
+A leader elected via VRF commit-reveal orders transactions, splits them across workers, and uses gossip for coordination. Workers execute deterministically, sign results, and return to the leader for L1 bundling.
 
-## Stress
+### Key Features (MVP Target)
+- **Epoch-based leadership**: 3-minute epochs (2 minutes processing, 1 minute election)
+- **Proof of Stake**: Basic staking and slashing mechanisms
+- **Proof of History**: Decentralized epoch timing using VDF prototype
+- **Optimistic execution**: No global consensus; challenges handled via fraud proofs
+- **Target throughput**: 1000+ TPS with 1/3 Byzantine fault tolerance
+- **Fair MEV distribution**: Experimental approach to prevent centralized extraction
+- **Censorship resistance**: Distributed transaction ordering
+- **Ethereum integration**: Basic compatibility with Ethereum-style L1 blockchains
 
-Not particularly aggressive yet but does basic correctness and stress
-testing.
+## MVP Development Roadmap
 
-Read more about the details of what it tests [in the
-README](./cmd/stress/README.md).
+### Phase 1: Core Consensus and Elections (I AM HERE)
+**Objectives:**
+- Implement basic PoS staking and slashing
+- Develop VRF commit-reveal election with 2/3 threshold
+- Build heartbeat monitoring and failover
+- Create PoH prototype for epoch timing (VDF implementation)
 
-```console
-$ cd cmd/stress
-$ go run main.go util.go
-```
+**Testing:**
+- Simulate 100 nodes for election fairness validation
 
-With the `go-deadlock` package turned off and the default `sync`
-package on, I get throughput of around 20k-40k entries/second with
-this stress test.
+### Phase 2: Transaction Processing and Gossip
+**Objectives:**
+- Implement leader batching and gossip distribution
+- Develop worker execution with signing and dependency gossip
+- Build basic optimistic fraud proof system
 
-# Distributed Key-Value Store API
+**Testing:**
+- Process 10,000 transactions with dependency handling
 
-Try out the builtin distributed key-value API.
+### Phase 3: L1 Integration and Incentives
+**Objectives:**
+- Implement rollup bundling for Ethereum testnet
+- Develop leader fee claiming mechanism
+- Explore basic worker reward systems
+- Conduct Byzantine simulations (1/3 malicious nodes)
 
-```console
-$ cd cmd/kvapi && go build
-$ rm *.dat
-```
+**Testing:**
+- Deploy to Sepolia testnet
+- Benchmark TPS and latency performance
 
-## Terminal 1
+### Phase 4: MVP Deployment
+**Objectives:**
+- Implement cross-rollup APIs
+- Deploy to testnet with node onboarding
+- Basic monitoring for liveness and MEV
 
-```console
-$ ./kvapi --node 1 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
-```
+**Deliverables:**
+- Functional MVP on testnet
+- Basic monitoring and metrics
 
-## Terminal 2
+## Current Status
+## Technical Architecture (Draft)
 
-```console
-$ ./kvapi --node 1 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
-```
+- **Consensus**: Modified Raft-inspired with rotating leadership
+- **Election**: VRF commit-reveal mechanism
+- **Communication**: Gossip protocols for coordination
+- **Timing**: Proof of History (PoH) using Verifiable Delay Functions
+- **Security**: Basic Proof of Stake with slashing conditions
+- **Target Performance**: 1000+ TPS (experimental)
+- **Fault Tolerance**: Byzantine fault tolerance up to 1/3 of nodes
 
-## Terminal 3
-
-```console
-$ ./kvapi --node 2 --http :2021 --cluster "0,:3030;1,:3031;2,:3032"
-```
-
-## Terminal 4
-
-Remember that requests will go through the leader (except for if we
-turn that off in the `/get` request). So you'll have to try sending a
-message to each server until you find the leader.
-
-To set a key:
-
-```console
-$ curl http://localhost:2020/set?key=y&value=hello
-```
-
-To get a key:
-
-```console
-$ curl http://localhost:2020/get\?key\=y
-```
-
-# References
-
-* [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf): The Raft paper.
-* [raft.tla](https://github.com/ongardie/raft.tla/blob/master/raft.tla): Diego Ongaro's TLA+ spec for Raft.
-* Jon Gjengset's [Students' Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/)
-* Jack Vanlightly's [Detecting Bugs in Data Infrastructure using Formal Methods (TLA+ Series Part 1)](https://medium.com/splunk-maas/detecting-bugs-in-data-infrastructure-using-formal-methods-704fde527c58): An intro to TLA+.
-
-And useful implementations I looked at for inspiration and clarity.
-
-* Hashicorp's [Raft implementation](https://github.com/hashicorp/raft) in Go: Although it's often quite complicated to learn from since it actually is intended for production.
-* Eli Bendersky's [Raft implementation](https://github.com/eliben/raft) in Go: Although it gets confusing because it uses negative numbers for terms whereas the paper does not.
-* Jing Yang's [Raft implementation](https://github.com/ditsing/ruaft) in Rust.
+ 
