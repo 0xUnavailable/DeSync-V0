@@ -1,1372 +1,586 @@
-package desync
+package main
+
+// Updated Desync prototype
+// - Aligned with DESYNC v3.1 blueprint
+// - NOTE: This remains a prototype. For production you must:
+//   * Replace the vrf stubs with a real VRF (e.g. libp2p/crypto VRF or EC-VRF)
+//   * Integrate with Tendermint ABCI for CheckTx/DeliverTx/Commit lifecycle
+//   * Use a proven database (LevelDB/RocksDB) for persistence and atomic state
+//   * Harden slashing, staking, and evidence logic
+//
+// Key improvements in this file:
+// - Deterministic ordering uses BlockHeight + IndexInBlock (not local timestamps)
+// - computeStateRoot implemented as a Merkle tree over key||value leaves
+// - Receipt and BatchResult types added, with a basic VerifyReceipt implementation
+// - Persistence uses atomic tempfile + rename for durability
+// - VRF replaced with HMAC-SHA256-based deterministic stub (replace with real VRF)
+// - Many TODOs call out where production work is required
 
 import (
+	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
-	"math/rand"
-	"net"
-	"net/http"
-	"net/rpc"
 	"os"
-	"path"
 	"sort"
 	"sync"
 	"time"
+	"github.com/ProtonMail/go-ecvrf/ecvrf"
+
 )
 
-const (
-	// EpochDuration defines the total duration of each epoch in the DESYNC protocol
-	EpochDuration = 180 * time.Second
-	// ProcessingPhase is the duration allocated for transaction processing within an epoch
-	ProcessingPhase = 120 * time.Second
-	// ElectionPhase is the duration for leader election within an epoch
-	ElectionPhase = 60 * time.Second
-	// ElectionCommitPeriod is the time window for committing VRF hashes during election
-	ElectionCommitPeriod = 40 * time.Second
-	// ElectionRevealPeriod is the time window for revealing VRF hashes and proofs
-	ElectionRevealPeriod = 20 * time.Second
-	// HeartbeatInterval is the frequency at which leaders and backup leaders send heartbeats
-	HeartbeatInterval = 100 * time.Millisecond
-	// HeartbeatTimeout is the threshold to detect heartbeat failure
-	HeartbeatTimeout = 500 * time.Millisecond
-	// WorkerExecutionTimeout is the maximum time a worker has to execute a batch
-	WorkerExecutionTimeout = 30 * time.Second
-	// EmergencyElectionDelay is the stabilization delay before triggering an emergency election
-	EmergencyElectionDelay = 1 * time.Second
-	// MaxBatchSize is the maximum number of transactions per batch
-	MaxBatchSize = 1000
-	// GenesisQuorumTimeout is the timeout for achieving quorum during genesis election
-	GenesisQuorumTimeout = 10 * time.Second
-	// NodeJoinTimeout is the timeout for node join operations
-	NodeJoinTimeout = 10 * time.Second
-)
-
-func Assert[T comparable](msg string, a, b T) {
-	if a != b {
-		panic(fmt.Sprintf("%s. Got a = %#v, b = %#v", msg, a, b))
-	}
-}
-
-type StateMachine interface {
-	// Apply executes a command on the state machine and returns the result
-	Apply(cmd []byte) ([]byte, error)
-}
-
-type ApplyResult struct {
-	Result []byte
-	Error  error
-}
-
-type Entry struct {
-	Epoch     uint64 // Epoch number for this log entry
-	Index     uint64 // Log index within the epoch
-	TxID      []byte // Transaction ID
-	TxData    []byte // Transaction data
-	Timestamp uint64 // Microsecond timestamp for ordering
-}
+// ---------------------------
+// Data structures (aligned with spec v3.1)
+// ---------------------------
 
 type Transaction struct {
-	TxID             []byte // Hash of transaction data
-	TxData           []byte // Raw transaction bytes
-	ArrivalTimestamp uint64 // Microsecond timestamp when received
-	GasPrice         uint64 // Gas price for MEV-resistant ordering
+	TxID         []byte // sha256(tx_data)
+	TxData       []byte
+	Signature    []byte
+	PubKey       []byte
+	Nonce        uint64
+	GasPrice     uint64
+	BlockHeight  uint64 // deterministic ordering source (set by proposer/ABCI)
+	IndexInBlock uint32 // deterministic ordering source (set by proposer/ABCI)
 }
 
 type Batch struct {
-	BatchID          uint64        // Unique batch identifier
-	Sequence         uint64        // Sequence number for ordering
-	Transactions     []Transaction // List of transactions in the batch
-	WorkerID         uint64        // Assigned worker node ID
-	CreatedTimestamp time.Time     // Timestamp when batch was created
+	BatchID      uint64
+	BlockHeight  uint64
+	Sequence     uint64
+	TxHashes     [][]byte
+	PrevStateRoot []byte
+	WorkerID     uint64
 }
 
-type ExecutionResult struct {
-	TxID         []byte        // Transaction ID
-	Success      bool          // Execution success flag
-	ResultData   []byte        // Execution output
-	GasUsed      uint64        // Gas consumed
-	StateChanges []StateChange // State modifications from execution
-}
-
-type StateChange struct {
-	Key      []byte // State key modified
-	OldValue []byte // Previous value
-	NewValue []byte // New value
+type Proof struct {
+	Key        []byte
+	OldValue   []byte
+	NewValue   []byte
+	MerkleProof [][]byte // sibling hashes from leaf up to root
 }
 
 type BatchResult struct {
-	BatchID          uint64            // Batch identifier
-	WorkerID         uint64            // Worker that executed the batch
-	ExecutionResults []ExecutionResult // Results for each transaction
-}
-
-type StateRequest struct {
-	RequestingWorker uint64    // ID of the requesting worker
-	StateKeys        [][]byte  // Keys needed from state
-	BatchID          uint64    // Batch requiring the state
-	Timestamp        time.Time // Request timestamp
-}
-
-type JoinRequest struct {
-	NodeID    uint64    // Joining node's ID
-	Address   string    // Node's network address
-	Signature []byte    // Signature of join request fields
-	Timestamp time.Time // Request timestamp
-}
-
-type GenesisConfig struct {
-	ClusterMembers   []ClusterMember // Initial cluster members
-	GenesisTimestamp uint64          // Microsecond timestamp for genesis
-	EpochDuration    string          // Epoch duration string
-	BootstrapNodes   []string        // Bootstrap node addresses
-}
-
-type RPCMessage struct {
-	Epoch uint64 // Current epoch for message
-}
-
-type VRFRevealRequest struct {
-	RPCMessage
-	SenderID     uint64 // Sender node ID
-	RevealedHash uint64 // Revealed VRF hash
-	VRFProof     []byte // VRF proof
-}
-
-type VRFRevealResponse struct {
-	RPCMessage
-}
-
-type HeartbeatRequest struct {
-	RPCMessage
-	SenderID  uint64    // Sender node ID
-	Role      string    // Sender's role
-	Timestamp time.Time // Heartbeat timestamp
-}
-
-type HeartbeatResponse struct {
-	RPCMessage
-}
-
-type BatchAssignmentRequest struct {
-	RPCMessage
-	Batch          Batch  // Assigned batch
-	TargetWorker   uint64 // Target worker ID
-	SequenceNumber uint64 // Batch sequence number
-}
-
-type BatchAssignmentResponse struct {
-	RPCMessage
-}
-
-type BatchResultRequest struct {
-	RPCMessage
-	Result       BatchResult // Execution result
-	TargetLeader uint64      // Target leader ID
-}
-
-type BatchResultResponse struct {
-	RPCMessage
-}
-
-type StateDependencyRequest struct {
-	RPCMessage
-	Request      StateRequest // State request details
-	TargetWorker uint64       // Target worker ID
-}
-
-type StateDependencyResponse struct {
-	RPCMessage
-	StateData    map[string][]byte // Requested state data
-	TargetWorker uint64            // Original target
-	RequestID    uint64            // Request identifier
-}
-
-type NodeJoinRequest struct {
-	RPCMessage
-	Request      JoinRequest // Join request details
-	TargetLeader uint64      // Target leader ID
-}
-
-type NodeJoinResponse struct {
-	RPCMessage
-	Approved bool // Approval status
-}
-
-type NodeJoinApprovalRequest struct {
-	RPCMessage
-	NodeID    uint64    // Node ID being approved
-	Approved  bool      // Approval decision
-	VoterID   uint64    // Voter node ID
-	Signature []byte    // Voter signature
-	Timestamp time.Time // Approval timestamp
-}
-
-type NodeJoinApprovalResponse struct {
-	RPCMessage
-}
-
-type ClusterMemberUpdateRequest struct {
-	RPCMessage
-	NewMember ClusterMember // New cluster member
-	Signature []byte        // Leader's signature
-}
-
-type ClusterMemberUpdateResponse struct {
-	RPCMessage
-}
-
-type LeaderQueryRequest struct {
-	RPCMessage
-}
-
-type LeaderQueryResponse struct {
-	RPCMessage
-	LeaderID            uint64 // Current leader ID
-	BackupLeaderID      uint64 // Current backup leader ID
-	Epoch               uint64 // Current epoch
-	SenderID            uint64 // Sender ID
-	LeaderAddress       string // Address of the leader
-	BackupLeaderAddress string // Address of the backup leader
-}
-
-type GetClusterRequest struct {
-	RPCMessage
-}
-
-type GetClusterResponse struct {
-	RPCMessage
-	Cluster []ClusterMember
-}
-
-type ClusterMember struct {
-	Id         uint64      // Member node ID
-	Address    string      // Network address
-	LastSeen   time.Time   // Last activity timestamp
-	rpcClient  *rpc.Client // RPC client connection
-}
-
-type ServerState string
-
-// ServerState represents the role of a server. Concrete role strings are used
-// directly in code to keep the protocol simple and human-readable.
-
-type Server struct {
-	done   bool
-	server *http.Server
-
-	Debug bool
-
-	mu sync.Mutex
-
-	currentEpoch uint64
-
-	log []Entry
-
-	// commitIndex, lastApplied and state were removed as they were unused in
-	// this implementation. They can be reintroduced when implementing Raft-
-	// compatible log replication.
-
-	id uint64
-
-	address string
-
-	electionTimeout time.Time
-
-	heartbeatMs int
-
-	// heartbeatTimeout removed; lastHeartbeat map provides per-node timings.
-
-	statemachine StateMachine
-
-	metadataDir string
-
-	fd *os.File
-
-	cluster []ClusterMember
-
-	clusterIndex int
-
-	revealedHash uint64
-
-	genesisConfig *GenesisConfig
-
-	role string
-
-	leaderID uint64
-
-	backupLeaderID uint64
-
-	epochStartTime time.Time
-
-	lastHeartbeat map[uint64]time.Time
-
-	txPool map[string]Transaction
-
-	workerBatches map[uint64]Batch
-
-	workerResults map[uint64]BatchResult
-
-	batchSequence uint64
-
-	pendingJoinRequests map[uint64]JoinRequest
-
-	currentBatch Batch
-
-	executionState map[string][]byte
-
-	dependencyRequests []StateRequest
-
-	validReveals map[uint64]uint64
-
-	pendingApprovals map[uint64]map[uint64]bool // join node to voter to approved
-
-	lastBatchTime time.Time
-
-	leaderAddress string
-
-	backupLeaderAddress string
-}
-
-func min[T ~int | ~uint64](a, b T) T {
-	if a < b {
-		return a
+	BatchID          uint64
+	WorkerID         uint64
+	PostStateRoot    []byte
+	Proofs           []Proof
+	ExecutionSummary struct {
+		TxCount     uint32
+		SuccessCount uint32
+		GasUsed     uint64
 	}
-	return b
+	Signature []byte
 }
 
-// max is intentionally omitted to avoid an unused generic helper. Use math or
-// explicit comparisons where needed.
-
-func (s *Server) debugmsg(msg string) string {
-	return fmt.Sprintf("%s [Id: %d, Epoch: %d] %s", time.Now().Format(time.RFC3339Nano), s.id, s.currentEpoch, msg)
+type Receipt struct {
+	BatchID       uint64
+	WorkerID      uint64
+	PostStateRoot []byte
+	Signature     []byte
 }
 
-func (s *Server) debug(msg string) {
-	if !s.Debug {
-		return
-	}
-	fmt.Println(s.debugmsg(msg))
+type Evidence struct {
+	ReporterID       uint64
+	OffendingReceipt Receipt
+	CounterProof     Proof
+	TimestampUnixMs  int64
+	Signature        []byte
 }
 
-func (s *Server) debugf(msg string, args ...any) {
-	if !s.Debug {
-		return
-	}
-
-	s.debug(fmt.Sprintf(msg, args...))
-}
-
-func (s *Server) warn(msg string) {
-	fmt.Println("[WARN] " + s.debugmsg(msg))
-}
-
-func (s *Server) warnf(msg string, args ...any) {
-	s.warn(fmt.Sprintf(msg, args...))
-}
-
-func Server_assert[T comparable](s *Server, msg string, a, b T) {
-	Assert(s.debugmsg(msg), a, b)
-}
-
-func NewServer(
-	clusterConfig []ClusterMember,
-	genesisConfig *GenesisConfig,
-	statemachine StateMachine,
-	metadataDir string,
-	clusterIndex int,
-) *Server {
-	// Validate and copy cluster configuration
-	var cluster []ClusterMember
-	for _, c := range clusterConfig {
-		if c.Id == 0 {
-			panic("Id must not be 0.")
-		}
-		cluster = append(cluster, c)
-	}
-
-	if len(cluster) == 0 {
-		panic("clusterConfig must contain at least one member")
-	}
-
-	if clusterIndex < 0 || clusterIndex >= len(cluster) {
-		panic("clusterIndex out of range")
-	}
-
-	s := &Server{
-		id:                  cluster[clusterIndex].Id,
-		address:             cluster[clusterIndex].Address,
-		cluster:             cluster,
-		genesisConfig:       genesisConfig,
-		statemachine:        statemachine,
-		metadataDir:         metadataDir,
-		clusterIndex:        clusterIndex,
-		heartbeatMs:         100,
-		lastHeartbeat:       make(map[uint64]time.Time),
-		txPool:              make(map[string]Transaction),
-		workerBatches:       make(map[uint64]Batch),
-		workerResults:       make(map[uint64]BatchResult),
-		pendingJoinRequests: make(map[uint64]JoinRequest),
-		executionState:      make(map[string][]byte),
-		dependencyRequests:  []StateRequest{},
-		validReveals:        make(map[uint64]uint64),
-		pendingApprovals:    make(map[uint64]map[uint64]bool),
-	}
-
-	return s
-}
-
-func (s *Server) vrfGenerateHash(seed []byte) (hash uint64, proof []byte) {
-	src := rand.NewSource(time.Now().UnixNano())
-	r := rand.New(src)
-	hash = r.Uint64()
-	proof = nil
-	return
-}
+// ---------------------------
+// Persistent state
+// ---------------------------
 
 type PersistentState struct {
-	CurrentEpoch  uint64
-	GenesisConfig *GenesisConfig
-	Log           []Entry
-	Cluster       []ClusterMember
+	CurrentEpoch uint64
+	NodeID       uint64
+	PrivateKey   []byte // ed25519 seed or similar
+	Stake        uint64
+	StateRoot    []byte
+	// other genesis / cluster config omitted for brevity
 }
 
-func (s *Server) persist() {
-	// Persist critical state to disk for crash recovery
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var err error
-	if s.fd == nil {
-		s.fd, err = os.OpenFile(
-			path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
-			os.O_SYNC|os.O_CREATE|os.O_RDWR,
-			0755,
-		)
-		if err != nil {
-			panic(err)
-		}
-	}
+// persist/restore use gob to (atomically) write to disk
+var persistMu sync.Mutex
 
-	if _, err = s.fd.Seek(0, 0); err != nil {
-		panic(err)
-	}
-
-	if err = s.fd.Truncate(0); err != nil {
-		panic(err)
-	}
-
-	enc := gob.NewEncoder(s.fd)
-
-	err = enc.Encode(PersistentState{
-		CurrentEpoch:  s.currentEpoch,
-		GenesisConfig: s.genesisConfig,
-		Log:           s.log,
-		Cluster:       s.cluster,
-	})
+func persistState(path string, s *PersistentState) error {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
-		panic(err)
+		return err
 	}
-
-	if err = s.fd.Sync(); err != nil {
-		s.warnf("Error syncing persistent state: %v", err)
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(s); err != nil {
+		f.Close()
+		return err
 	}
-
-	s.debugf("Persisted state.")
+	f.Sync()
+	f.Close()
+	return os.Rename(tmp, path)
 }
 
-func (s *Server) restore() {
-	// Restore persistent state from disk
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var err error
-	if s.fd == nil {
-		s.fd, err = os.OpenFile(
-			path.Join(s.metadataDir, fmt.Sprintf("md_%d.dat", s.id)),
-			os.O_SYNC|os.O_CREATE|os.O_RDWR,
-			0755,
-		)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	if _, err = s.fd.Seek(0, 0); err != nil {
-		panic(err)
-	}
-
-	dec := gob.NewDecoder(s.fd)
-
-	var ps PersistentState
-	err = dec.Decode(&ps)
-	if err == io.EOF {
-		// Initialize new state if no persistent data
-		s.log = []Entry{}
-		s.ensureLog()
-		// Best-effort persist; do not panic on sync errors here
-		s.persist()
-		return
-	}
-
+func restoreState(path string) (*PersistentState, error) {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	f, err := os.Open(path)
 	if err != nil {
-		// If decode fails, warn and reinitialize to avoid crash on corrupt file
-		s.warnf("Failed to decode persistent state (%v); reinitializing", err)
-		s.log = []Entry{}
-		s.ensureLog()
-		s.persist()
-		return
+		return nil, err
 	}
-
-	// Load restored state
-	s.currentEpoch = ps.CurrentEpoch
-	s.genesisConfig = ps.GenesisConfig
-	s.log = ps.Log
-	s.cluster = ps.Cluster
-
-	s.ensureLog()
+	defer f.Close()
+	dec := gob.NewDecoder(f)
+	var s PersistentState
+	if err := dec.Decode(&s); err != nil {
+		return nil, err
+	}
+	return &s, nil
 }
 
-func (s *Server) ensureLog() {
-	// Ensure log has at least one entry
-	if len(s.log) == 0 {
-		s.log = append(s.log, Entry{})
+// ---------------------------
+// Execution state (in-memory prototype)
+// ---------------------------
+
+var executionState = make(map[string][]byte) // key -> value
+var execMu sync.RWMutex
+
+// Helper: deterministic list of keys for Merkle leaves
+func sortedKeysMap(m map[string][]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
+	sort.Strings(keys)
+	return keys
 }
 
-func (s *Server) broadcast(name string, req any) {
-	// Broadcast RPC request to all cluster members except self
-	for i := range s.cluster {
-		if i == s.clusterIndex {
-			continue
+// computeStateRoot: Merkle tree over leaves H(key || value)
+// Returns root and map of leaf hash to its index for proof generation.
+func computeStateRootFromMap(state map[string][]byte) ([]byte, []byte, map[string]int) {
+	// Build leaves
+	keys := sortedKeysMap(state)
+	leaves := make([][]byte, 0, len(keys))
+	indexOf := make(map[string]int)
+	for i, k := range keys {
+		d := append([]byte(k), state[k]...)
+		h := sha256.Sum256(d)
+		leaves = append(leaves, h[:])
+		indexOf[k] = i
+	}
+	// If no leaves, return zero root
+	if len(leaves) == 0 {
+		empty := sha256.Sum256([]byte{})
+		return empty[:], nil, indexOf
+	}
+	// Build tree
+	nodes := leaves
+	for len(nodes) > 1 {
+		var next [][]byte
+		for i := 0; i < len(nodes); i += 2 {
+			if i+1 == len(nodes) {
+				// duplicate last node (simple Merkle padding)
+				h := sha256.Sum256(append(nodes[i], nodes[i]...))
+				next = append(next, h[:])
+			} else {
+				concat := append(nodes[i], nodes[i+1]...)
+				h := sha256.Sum256(concat)
+				next = append(next, h[:])
+			}
 		}
-
-		go func(i int) {
-			var rsp interface{}
-			_ = s.rpcCall(i, name, req, &rsp)
-		}(i)
+		nodes = next
 	}
+	root := nodes[0]
+	// For convenience also return concatenated leaf hashes blob (not required)
+	leavesConcat := bytesConcat(leaves)
+	return root, leavesConcat, indexOf
 }
 
-func (s *Server) HandleVRFRevealRequest(req VRFRevealRequest, rsp *VRFRevealResponse) error {
-	// Handle VRF reveal and verify during election reveal phase
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if req.Epoch != s.currentEpoch {
-		return nil
+func bytesConcat(arr [][]byte) []byte {
+	var out []byte
+	for _, a := range arr {
+		out = append(out, a...)
 	}
-
-	s.validReveals[req.SenderID] = req.RevealedHash
-
-	return nil
+	return out
 }
 
-func (s *Server) HandleHeartbeatRequest(req HeartbeatRequest, rsp *HeartbeatResponse) error {
-	// Update last heartbeat timestamp for liveness tracking
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if req.Epoch != s.currentEpoch {
-		return nil
-	}
-
-	s.lastHeartbeat[req.SenderID] = req.Timestamp
-
-	return nil
-}
-
-func (s *Server) HandleBatchAssignmentRequest(req BatchAssignmentRequest, rsp *BatchAssignmentResponse) error {
-	// Workers receive and start executing assigned batch
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.role != "worker" {
-		return nil
-	}
-
-	s.currentBatch = req.Batch
-
-	go s.executeBatchWithDependencies(req.Batch)
-
-	return nil
-}
-
-func (s *Server) HandleBatchResultRequest(req BatchResultRequest, rsp *BatchResultResponse) error {
-	// Leader collects execution results from workers
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.role != "leader" {
-		return nil
-	}
-
-	if _, ok := s.workerBatches[req.Result.WorkerID]; !ok {
-		return nil // ignore invalid result
-	}
-
-	s.workerResults[req.Result.WorkerID] = req.Result
-
-	return nil
-}
-
-func (s *Server) HandleStateDependencyRequest(req StateDependencyRequest, rsp *StateDependencyResponse) error {
-	// Provide state data for dependency resolution between workers
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rsp.StateData = make(map[string][]byte)
-
-	for _, key := range req.Request.StateKeys {
-		strKey := string(key)
-		if val, ok := s.executionState[strKey]; ok {
-			rsp.StateData[strKey] = val
+// Generate Merkle inclusion proof for a given key, using current executionState snapshot
+// Proof is list of sibling hashes from leaf to root.
+func generateInclusionProof(key string, state map[string][]byte) ([][]byte, error) {
+	keys := sortedKeysMap(state)
+	index := -1
+	for i, k := range keys {
+		if k == key {
+			index = i
+			break
 		}
 	}
-
-	return nil
-}
-
-func (s *Server) HandleNodeJoinRequest(req NodeJoinRequest, rsp *NodeJoinResponse) error {
-	// Process node join requests: leaders queue, others approve
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.role == "leader" {
-		rsp.Approved = true
-		s.pendingJoinRequests[req.Request.NodeID] = req.Request
-	} else {
-		approved := true
-		approvalReq := NodeJoinApprovalRequest{
-			RPCMessage: RPCMessage{Epoch: s.currentEpoch},
-			NodeID:     req.Request.NodeID,
-			Approved:   approved,
-			VoterID:    s.id,
-			Signature:  []byte{}, // sign
-			Timestamp:  time.Now(),
+	if index == -1 {
+		return nil, errors.New("key-not-found")
+	}
+	// Build leaves
+	leaves := make([][]byte, 0, len(keys))
+	for _, k := range keys {
+		d := append([]byte(k), state[k]...)
+		h := sha256.Sum256(d)
+		leaves = append(leaves, h[:])
+	}
+	// Build proof
+	proof := make([][]byte, 0)
+	i := index
+	nodes := leaves
+	for len(nodes) > 1 {
+		var next [][]byte
+		for j := 0; j < len(nodes); j += 2 {
+			var left, right []byte
+			left = nodes[j]
+			if j+1 < len(nodes) {
+				right = nodes[j+1]
+			} else {
+				right = nodes[j] // duplicate
+			}
+			// Determine sibling for the tracked index
+			if j == i || j+1 == i {
+				// sibling is either left or right depending
+				if j == i {
+					proof = append(proof, right)
+				} else {
+					proof = append(proof, left)
+				}
+				// new index in next level
+				newIndex := len(next)
+				_ = newIndex
+			}
+			concat := append(left, right...)
+			h := sha256.Sum256(concat)
+			next = append(next, h[:])
 		}
-		var approvalRsp NodeJoinApprovalResponse
-		s.rpcCall(s.getClusterIndex(req.TargetLeader), "Server.HandleNodeJoinApprovalRequest", approvalReq, &approvalRsp)
-		rsp.Approved = approved
+		i = i / 2
+		nodes = next
 	}
-
-	return nil
+	return proof, nil
 }
 
-func (s *Server) HandleNodeJoinApprovalRequest(req NodeJoinApprovalRequest, rsp *NodeJoinApprovalResponse) error {
-	// Leader collects approvals for join requests
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.role != "leader" {
-		return nil
+// verifyInclusionProof verifies that leafHash combined with proof yields root using pairing strategy
+func verifyInclusionProof(leafHash []byte, proof [][]byte, index int) []byte {
+	hash := leafHash
+	i := index
+	for _, sibling := range proof {
+		if i%2 == 0 {
+			concat := append(hash, sibling...)
+			h := sha256.Sum256(concat)
+			hash = h[:]
+		} else {
+			concat := append(sibling, hash...)
+			h := sha256.Sum256(concat)
+			hash = h[:]
+		}
+		i = i / 2
 	}
+	return hash
+}
 
-	if _, ok := s.pendingApprovals[req.NodeID]; !ok {
-		s.pendingApprovals[req.NodeID] = make(map[uint64]bool)
+// ---------------------------
+// VRF stub (HMAC-SHA256 based) - using ecvrf for real VRF
+// ---------------------------
+// vrfGenerateHash: prove VRF output from seed and private key bytes.
+// Returns beta (sha256(proof)) as VRF output, proof, error.
+func vrfGenerateHash(seed []byte, privateKeyBytes []byte) ([]byte, []byte, error) {
+    sk, err := ecvrf.NewPrivateKey(privateKeyBytes)
+    if err != nil {
+        return nil, nil, err
+    }
+
+    beta, proof, err := sk.Prove(seed)
+    if err != nil {
+        return nil, nil, err
+    }
+
+    // beta is already the VRF output from library
+    return beta, proof, nil
+}
+
+func vrfVerifyHash(hash []byte, proof []byte, publicKeyBytes []byte, seed []byte) (bool, error) {
+    pk, err := ecvrf.NewPublicKey(publicKeyBytes)
+    if err != nil {
+        return false, err
+    }
+
+    ok, beta2, err := pk.Verify(seed, proof)
+    if err != nil {
+        return false, err
+    }
+    if !ok {
+        return false, nil
+    }
+
+    // Ensure the verified output matches the expected hash
+    return bytes.Equal(beta2, hash), nil
+}
+
+
+// ---------------------------
+// Receipt verification (basic)
+// ---------------------------
+
+func verifyReceipt(r Receipt, proofs []Proof, prevState map[string][]byte) (bool, error) {
+	// recompute post state root from prevState + proofs
+	// This is a simplified check: verify each proof that old_value matches prevState and that new_value is set.
+	// Then compute a candidate root from applying the changes and compare with r.PostStateRoot.
+	// Note: For production, proofs must be full SMT inclusion proofs and verification must be strict.
+
+	// Build a copy of prevState
+	tmp := make(map[string][]byte)
+	for k, v := range prevState {
+		tmp[k] = append([]byte(nil), v...)
 	}
-	s.pendingApprovals[req.NodeID][req.VoterID] = req.Approved
-
-	return nil
-}
-
-func (s *Server) HandleClusterMemberUpdateRequest(req ClusterMemberUpdateRequest, rsp *ClusterMemberUpdateResponse) error {
-	// Update cluster membership upon successful join
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.cluster = append(s.cluster, req.NewMember)
-
-	return nil
-}
-
-func (s *Server) HandleLeaderQueryRequest(req LeaderQueryRequest, rsp *LeaderQueryResponse) error {
-	// Respond with current leadership information
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rsp.LeaderID = s.leaderID
-	rsp.BackupLeaderID = s.backupLeaderID
-	rsp.Epoch = s.currentEpoch
-	rsp.SenderID = s.id
-	rsp.LeaderAddress = s.getAddress(s.leaderID)
-	rsp.BackupLeaderAddress = s.getAddress(s.backupLeaderID)
-
-	return nil
-}
-
-func (s *Server) HandleGetClusterRequest(req GetClusterRequest, rsp *GetClusterResponse) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if req.Epoch != s.currentEpoch {
-		return nil
+	// Apply proofs as diffs
+	for _, p := range proofs {
+		k := string(p.Key)
+		// verify old value matches
+		old := tmp[k]
+		if !byteSlicesEqual(old, p.OldValue) {
+			return false, fmt.Errorf("old value mismatch for key %x", p.Key)
+		}
+		// apply new
+		tmp[k] = append([]byte(nil), p.NewValue...)
 	}
-
-	rsp.Cluster = s.cluster
-
-	return nil
+	// compute root
+	root, _, _ := computeStateRootFromMap(tmp)
+	if !byteSlicesEqual(root, r.PostStateRoot) {
+		return false, fmt.Errorf("post state root mismatch")
+	}
+	// signature verify - omitted here (requires worker pubkey registry)
+	return true, nil
 }
 
-// updateEpoch removed - not used in the current implementation.
-
-func (s *Server) rpcCall(i int, name string, req any, rsp any) bool {
-	// Perform RPC call to cluster member, establishing connection if needed
-	// Read cluster member and cached client under lock
-	s.mu.Lock()
-	if i < 0 || i >= len(s.cluster) {
-		s.mu.Unlock()
-		s.warnf("rpcCall: invalid cluster index %d", i)
+func byteSlicesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	addr := s.cluster[i].Address
-	cached := s.cluster[i].rpcClient
-	targetID := s.cluster[i].Id
-	s.mu.Unlock()
-
-	var err error
-	var client *rpc.Client = cached
-	if client == nil {
-		client, err = rpc.DialHTTP("tcp", addr)
-		if err != nil {
-			s.warnf("Error dialing %s: %v", addr, err)
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
-		// cache the client for future calls
-		s.mu.Lock()
-		// re-check bounds in case cluster changed concurrently
-		if i >= 0 && i < len(s.cluster) {
-			s.cluster[i].rpcClient = client
-		}
-		s.mu.Unlock()
-	}
-
-	err = client.Call(name, req, rsp)
-	if err != nil {
-		s.warnf("Error calling %s on %d: %s.", name, targetID, err)
-		return false
 	}
 	return true
 }
 
-func (s *Server) callByAddress(address string, name string, req any, rsp any) bool {
-	client, err := rpc.DialHTTP("tcp", address)
-	if err != nil {
-		s.warnf("Error dialing %s: %s", address, err)
-		return false
+// ---------------------------
+// Deterministic ordering helper
+// ---------------------------
+func txLess(a, b Transaction) bool {
+	// First by BlockHeight, then IndexInBlock, then TxID lexicographic
+	if a.BlockHeight != b.BlockHeight {
+		return a.BlockHeight < b.BlockHeight
 	}
-	err = client.Call(name, req, rsp)
-	client.Close()
-	if err != nil {
-		s.warnf("Error calling %s on %s: %s", name, address, err)
-		return false
+	if a.IndexInBlock != b.IndexInBlock {
+		return a.IndexInBlock < b.IndexInBlock
 	}
-	return true
+	return hex.EncodeToString(a.TxID) < hex.EncodeToString(b.TxID)
 }
 
-func (s *Server) AcceptTransaction(txData []byte) []byte {
-	// Leader accepts and timestamps incoming transactions
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.role != "leader" {
-		return nil
-	}
-
-	hash := sha256.Sum256(txData)
-	txID := hash[:]
-	strID := string(txID)
-
-	timestamp := uint64(time.Now().UnixMicro())
-
-	s.txPool[strID] = Transaction{
-		TxID:             txID,
-		TxData:           txData,
-		ArrivalTimestamp: timestamp,
-		GasPrice:         0, // stub
-	}
-
-	return txID
-}
-
-func (s *Server) orderTransactionsDeterministic() []Transaction {
-	// Order transactions by arrival timestamp and tx_id for MEV resistance
-	var txs []Transaction
-	for _, tx := range s.txPool {
-		txs = append(txs, tx)
-	}
-
-	sort.Slice(txs, func(i, j int) bool {
-		if txs[i].ArrivalTimestamp != txs[j].ArrivalTimestamp {
-			return txs[i].ArrivalTimestamp < txs[j].ArrivalTimestamp
-		}
-		return string(txs[i].TxID) < string(txs[j].TxID)
+// orderTransactionsDeterministic: sort by blockHeight,index,txid
+func orderTransactionsDeterministic(txs []Transaction) []Transaction {
+	sort.SliceStable(txs, func(i, j int) bool {
+		return txLess(txs[i], txs[j])
 	})
-
 	return txs
 }
 
-func (s *Server) ShouldCreateBatch() bool {
-	// Determine if a new batch should be created based on size or timeout
-	return len(s.txPool) >= MaxBatchSize || time.Since(s.lastBatchTime) >= time.Second
-}
+// ---------------------------
+// Batch creation and execution (leader & worker prototypes)
+// ---------------------------
 
-func (s *Server) CreateAndDistributeBatches() {
-	// Leader creates batches from ordered transactions and assigns to workers
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	orderedTxs := s.orderTransactionsDeterministic()
-
-	activeWorkers := s.getActiveWorkers()
-
+func createSequentialBatches(ordered []Transaction, activeWorkers []uint64, maxBatchSize int, startSequence uint64, prevStateRoot []byte) []Batch {
+	batches := []Batch{}
 	if len(activeWorkers) == 0 {
-		return
+		return batches
 	}
-
-	batchSize := (len(orderedTxs) + len(activeWorkers) - 1) / len(activeWorkers)
-
-	for i, w := range activeWorkers {
-		start := i * batchSize
-		end := min(start+batchSize, len(orderedTxs))
-		txs := orderedTxs[start:end]
-
-		batchID := s.batchSequence
-
-		batch := Batch{
-			BatchID:          batchID,
-			Sequence:         s.batchSequence,
-			Transactions:     txs,
-			WorkerID:         w,
-			CreatedTimestamp: time.Now(),
-		}
-
-		s.workerBatches[w] = batch
-
-		s.batchSequence++
-
-		req := BatchAssignmentRequest{
-			RPCMessage:     RPCMessage{Epoch: s.currentEpoch},
-			Batch:          batch,
-			TargetWorker:   w,
-			SequenceNumber: batch.Sequence,
-		}
-
-		var rsp BatchAssignmentResponse
-		s.rpcCall(s.getClusterIndex(w), "Server.HandleBatchAssignmentRequest", req, &rsp)
-	}
-
-	s.txPool = make(map[string]Transaction)
-	s.lastBatchTime = time.Now()
-}
-
-func (s *Server) getActiveWorkers() []uint64 {
-	// Get list of active workers based on recent activity
-	var workers []uint64
-	for _, c := range s.cluster {
-		if c.Id != s.leaderID && c.Id != s.backupLeaderID {
-			workers = append(workers, c.Id)
-		}
-	}
-	return workers
-}
-
-func (s *Server) getClusterIndex(id uint64) int {
-	// Find cluster index for given node ID
-	for i, c := range s.cluster {
-		if c.Id == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func (s *Server) getAddress(id uint64) string {
-	i := s.getClusterIndex(id)
-	if i == -1 {
-		return ""
-	}
-	return s.cluster[i].Address
-}
-
-func (s *Server) executeBatchWithDependencies(batch Batch) {
-	// Worker executes batch, handling state dependencies (stubbed)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Stub execution, assume no dependencies
-
-	var executionResults []ExecutionResult
-
-	for _, tx := range batch.Transactions {
-		res, err := s.statemachine.Apply(tx.TxData)
-
-		success := err == nil
-
-		// Stub state changes
-
-		stateChanges := []StateChange{}
-
-		executionResults = append(executionResults, ExecutionResult{
-			TxID:         tx.TxID,
-			Success:      success,
-			ResultData:   res,
-			GasUsed:      0, // stub
-			StateChanges: stateChanges,
-		})
-	}
-
-	result := BatchResult{
-		BatchID:          batch.BatchID,
-		WorkerID:         s.id,
-		ExecutionResults: executionResults,
-	}
-
-	req := BatchResultRequest{
-		RPCMessage:   RPCMessage{Epoch: s.currentEpoch},
-		Result:       result,
-		TargetLeader: s.leaderID,
-	}
-
-	var rsp BatchResultResponse
-	s.rpcCall(s.getClusterIndex(s.leaderID), "Server.HandleBatchResultRequest", req, &rsp)
-}
-
-func (s *Server) AllBatchesCompleted() bool {
-	// Check if all assigned batches have results
-	return len(s.workerResults) == len(s.workerBatches)
-}
-
-func (s *Server) FinalizeBatchExecution() {
-	// Leader finalizes batch execution, verifies results, and bundles to L1
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var orderedResults []BatchResult
-
-	for _, res := range s.workerResults {
-		orderedResults = append(orderedResults, res)
-	}
-
-	sort.Slice(orderedResults, func(i, j int) bool {
-		return s.workerBatches[orderedResults[i].WorkerID].Sequence < s.workerBatches[orderedResults[j].WorkerID].Sequence
-	})
-
-	for _, res := range orderedResults {
-		// Apply state changes, stub
-		for _, execRes := range res.ExecutionResults {
-			for _, change := range execRes.StateChanges {
-				s.executionState[string(change.Key)] = change.NewValue
+	var batchTxHashes [][]byte
+	seq := startSequence
+	workerCount := len(activeWorkers)
+	for i, tx := range ordered {
+		batchTxHashes = append(batchTxHashes, tx.TxID)
+		if len(batchTxHashes) >= maxBatchSize || i == len(ordered)-1 {
+			worker := activeWorkers[(i/ maxBatchSize) % workerCount]
+			b := Batch{
+				BatchID: seq,
+				BlockHeight: ordered[0].BlockHeight,
+				Sequence: seq,
+				TxHashes: batchTxHashes,
+				PrevStateRoot: prevStateRoot,
+				WorkerID: worker,
 			}
+			batches = append(batches, b)
+			seq++
+			batchTxHashes = nil
 		}
 	}
-
-	s.bundleToL1(orderedResults)
-
-	s.workerBatches = make(map[uint64]Batch)
-	s.workerResults = make(map[uint64]BatchResult)
+	return batches
 }
 
-func (s *Server) bundleToL1(results []BatchResult) {
-	// Submit finalized batch results to L1 (stub)
-	// Stub
-	s.debug("Bundled to L1")
+// executeBatchWithDependencies: worker applies transactions deterministically using StateMachine.Apply (provided as interface)
+// For prototype, we model StateMachine.Apply as a simple function that sets key->value in executionState map.
+type StateMachine interface {
+	Apply(cmd []byte) ([]byte, error)
 }
 
-func (s *Server) computeEpochSeed(epoch uint64) []byte {
-	// Compute deterministic seed for VRF election
-	h := sha256.New()
-	if epoch == 1 && s.genesisConfig != nil {
-		timestampBytes := make([]byte, 8)
-		binary.LittleEndian.PutUint64(timestampBytes, s.genesisConfig.GenesisTimestamp)
-		h.Write(timestampBytes)
+type SimpleStateMachine struct{}
+func (s *SimpleStateMachine) Apply(cmd []byte) ([]byte, error) {
+    parts := bytes.SplitN(cmd, []byte(":"), 2)
+    if len(parts) != 2 {
+        return nil, fmt.Errorf("invalid cmd format, expected key:value")
+    }
+    key := string(parts[0])
+    value := parts[1]
+
+    execMu.Lock()
+    executionState[key] = append([]byte(nil), value...)
+    execMu.Unlock()
+
+    return []byte("OK"), nil
+}
+
+
+func executeBatchWithDependencies(b Batch, sm StateMachine, prevState map[string][]byte) (BatchResult, error) {
+	start := time.Now()
+	var res BatchResult
+	res.BatchID = b.BatchID
+	res.WorkerID = b.WorkerID
+
+	// For prototype, we simulate executing each tx by applying tx.TxData to state (assuming it's "key:val")
+	// and record state changes for proofs.
+	changes := make(map[string][]byte)
+	txCount := uint32(0)
+	successCount := uint32(0)
+	var gasUsed uint64 = 0
+
+	for _, th := range b.TxHashes {
+		// In a real system we would fetch the full tx by hash; here we assume TxData is reachable.
+		// For prototype, assume tx data encodes key:value and is available in a global map (omitted).
+		// We'll just simulate a change with a derived key.
+		txCount++
+		txKey := fmt.Sprintf("batch_%d_tx_%d", b.BatchID, txCount)
+		newVal := sha256.Sum256(th)
+		changes[txKey] = newVal[:]
+		successCount++
+		gasUsed += 1
 	}
-	epochBytes := make([]byte, 8)
-	binary.LittleEndian.PutUint64(epochBytes, epoch)
-	h.Write(epochBytes)
-	return h.Sum(nil)
-}
 
-func (s *Server) ParticipateInElection() {
-	// Participate in VRF-based leader election if staked sufficiently
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	currentTime := time.Now()
-
-	commitStart := s.epochStartTime.Add(ProcessingPhase)
-
-	revealStart := commitStart.Add(ElectionCommitPeriod)
-
-	if currentTime.After(revealStart) && currentTime.Before(revealStart.Add(ElectionRevealPeriod)) && s.revealedHash == 0 {
-		seed := s.computeEpochSeed(s.currentEpoch)
-		hash, proof := s.vrfGenerateHash(seed)
-		s.revealedHash = hash
-
-		req := VRFRevealRequest{
-			RPCMessage:   RPCMessage{Epoch: s.currentEpoch},
-			SenderID:     s.id,
-			RevealedHash: hash,
-			VRFProof:     proof,
+	// Build proofs and compute post state root by applying changes to prevState snapshot
+	tmp := make(map[string][]byte)
+	for k, v := range prevState {
+		tmp[k] = append([]byte(nil), v...)
+	}
+	for k, v := range changes {
+		old := tmp[k]
+		proof, _ := generateInclusionProof(k, tmp) // may return error if key missing
+		p := Proof{
+			Key: []byte(k),
+			OldValue: old,
+			NewValue: v,
+			MerkleProof: proof,
 		}
-
-		s.broadcast("Server.HandleVRFRevealRequest", req)
+		res.Proofs = append(res.Proofs, p)
+		tmp[k] = append([]byte(nil), v...)
 	}
+
+	root, _, _ := computeStateRootFromMap(tmp)
+	res.PostStateRoot = root
+	res.ExecutionSummary.TxCount = txCount
+	res.ExecutionSummary.SuccessCount = successCount
+	res.ExecutionSummary.GasUsed = gasUsed
+
+	// Signature stub: sign PostStateRoot using node private key if available
+	// For prototype we leave Signature empty (production: sign with worker private key)
+	res.Signature = []byte{}
+
+	// record duration
+	_ = start
+	return res, nil
 }
 
-func (s *Server) FinalizeElection() {
-	// Determine leaders based on weighted VRF reveals and update roles
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var reveals []struct {
-		id   uint64
-		hash uint64
-	}
-
-	for id, hash := range s.validReveals {
-		reveals = append(reveals, struct {
-			id   uint64
-			hash uint64
-		}{id, hash})
-	}
-
-	sort.Slice(reveals, func(i, j int) bool {
-		return reveals[i].hash < reveals[j].hash
-	})
-
-	if len(reveals) >= 2 {
-		s.leaderID = reveals[0].id
-		s.backupLeaderID = reveals[1].id
-		s.leaderAddress = s.getAddress(s.leaderID)
-		s.backupLeaderAddress = s.getAddress(s.backupLeaderID)
-	}
-
-	if s.leaderID == s.id {
-		s.role = "leader"
-	} else if s.backupLeaderID == s.id {
-		s.role = "backup_leader"
-	} else {
-		s.role = "worker"
-	}
-
-	s.revealedHash = 0
-	s.validReveals = make(map[uint64]uint64)
-
-	s.persist()
-
-	if s.role == "leader" {
-		s.ProcessPendingJoins()
-	}
+// ---------------------------
+// Utilities
+// ---------------------------
+func sha256Hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
 }
 
-func (s *Server) CheckGenesisConditions() bool {
-	// Check if node should initiate genesis startup
-	return s.genesisConfig != nil && s.currentEpoch == 0 && uint64(time.Now().UnixMicro()) >= s.genesisConfig.GenesisTimestamp
+// simple helper to compute tx id
+func computeTxID(txData []byte) []byte {
+	h := sha256.Sum256(txData)
+	return h[:]
 }
 
-func (s *Server) HandleGenesisStartup() {
-	// Initiate genesis election with staggered delay
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// ---------------------------
+// Small demo of usage (not networked) - demonstrates create batches and compute roots
+// ---------------------------
 
-	stagger := time.Duration(s.id%100) * time.Millisecond
+func main() {
+	// Demo: setup state, create txs, order them, create batches, execute, verify receipts
+	fmt.Println("DESYNC prototype (updated). Demo run...")
 
-	time.Sleep(stagger)
-
-	s.currentEpoch = 1
-
-	s.epochStartTime = time.Now()
-
-	s.ParticipateInElection()
-}
-
-func (s *Server) JoinExistingCluster() {
-	// Join running cluster by querying leader and sending join request
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var leaderAddress string
-
-	// Query bootstrap for leader
-
-	if s.genesisConfig != nil {
-		for _, boot := range s.genesisConfig.BootstrapNodes {
-			client, err := rpc.DialHTTP("tcp", boot)
-			if err != nil {
-				continue
-			}
-
-			req := LeaderQueryRequest{RPCMessage: RPCMessage{}}
-			var rsp LeaderQueryResponse
-			err = client.Call("Server.HandleLeaderQueryRequest", req, &rsp)
-			client.Close()
-			if err == nil {
-				s.leaderID = rsp.LeaderID
-				s.backupLeaderID = rsp.BackupLeaderID
-				s.currentEpoch = rsp.Epoch
-				leaderAddress = rsp.LeaderAddress
-				s.leaderAddress = leaderAddress
-				s.backupLeaderAddress = rsp.BackupLeaderAddress
-				break
-			}
-		}
+	// persistent state load/save demo
+	p := &PersistentState{
+		CurrentEpoch: 1,
+		NodeID: 1,
+		PrivateKey: []byte("demo-private-key-32bytes-length-should-be-replaced"),
+		Stake: 1000,
+		StateRoot: []byte{},
 	}
-
-	if s.leaderID == 0 {
-		// No leader, wait for election
-		return
-	}
-
-	if s.currentEpoch == 0 {
-		// new node, send join
-
-		joinReq := JoinRequest{
-			NodeID:    s.id,
-			Address:   s.address,
-			Signature: []byte{}, // sign
-			Timestamp: time.Now(),
-		}
-
-		req := NodeJoinRequest{
-			RPCMessage:   RPCMessage{Epoch: s.currentEpoch},
-			Request:      joinReq,
-			TargetLeader: s.leaderID,
-		}
-
-		var rsp NodeJoinResponse
-		s.callByAddress(leaderAddress, "Server.HandleNodeJoinRequest", req, &rsp)
-
-		if rsp.Approved {
-			s.RequestStateSyncFromLeader()
-		}
-	} else {
-		// recovery, sync
-		s.RequestStateSyncFromLeader()
-	}
-}
-
-func (s *Server) RequestStateSyncFromLeader() {
-	// Synchronize state with leader after join or recovery (stub)
-	s.mu.Lock()
-	leaderAddress := s.leaderAddress
-	s.mu.Unlock()
-
-	req := GetClusterRequest{RPCMessage: RPCMessage{Epoch: s.currentEpoch}}
-	var rsp GetClusterResponse
-	if s.callByAddress(leaderAddress, "Server.HandleGetClusterRequest", req, &rsp) {
-		s.mu.Lock()
-		s.cluster = rsp.Cluster
-		// Add self if not present
-		if s.getClusterIndex(s.id) == -1 {
-			s.cluster = append(s.cluster, ClusterMember{
-				Id:       s.id,
-				Address:  s.address,
-				LastSeen: time.Now(),
-			})
-		}
-		s.mu.Unlock()
-	}
-
-	s.debug("Synced state from leader")
-}
-
-func (s *Server) ProcessPendingJoins() {
-	// Process queued join requests at epoch boundary with cluster approval
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for nodeID, req := range s.pendingJoinRequests {
-		// Broadcast to cluster for approval
-
-		bReq := NodeJoinRequest{
-			RPCMessage:   RPCMessage{Epoch: s.currentEpoch},
-			Request:      req,
-			TargetLeader: s.id,
-		}
-
-		s.broadcast("Server.HandleNodeJoinRequest", bReq)
-
-		// Wait for approvals, stub
-
-		time.Sleep(time.Second) // stub
-
-		approvalCount := uint64(0)
-		for _, approved := range s.pendingApprovals[nodeID] {
-			if approved {
-				approvalCount++
-			}
-		}
-
-		if approvalCount >= uint64(len(s.cluster))*2/3 {
-			newMember := ClusterMember{
-				Id:       nodeID,
-				Address:  req.Address,
-				LastSeen: time.Now(),
-			}
-
-			updateReq := ClusterMemberUpdateRequest{
-				RPCMessage: RPCMessage{Epoch: s.currentEpoch},
-				NewMember:  newMember,
-				Signature:  []byte{}, // sign
-			}
-
-			s.broadcast("Server.HandleClusterMemberUpdateRequest", updateReq)
-
-			s.cluster = append(s.cluster, newMember)
-		}
-
-		delete(s.pendingJoinRequests, nodeID)
-		delete(s.pendingApprovals, nodeID)
-	}
-}
-
-func (s *Server) SendHeartbeat() {
-	// Send heartbeat if leader or backup leader
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.role != "leader" && s.role != "backup_leader" {
-		return
-	}
-
-	req := HeartbeatRequest{
-		RPCMessage: RPCMessage{Epoch: s.currentEpoch},
-		SenderID:   s.id,
-		Role:       s.role,
-		Timestamp:  time.Now(),
-	}
-
-	s.broadcast("Server.HandleHeartbeatRequest", req)
-}
-
-func (s *Server) CheckForFailures() {
-	// Detect leader/backup failures and trigger promotion or emergency election
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	currentTime := time.Now()
-
-	leaderTimeout := currentTime.Sub(s.lastHeartbeat[s.leaderID]) > HeartbeatTimeout
-
-	backupTimeout := currentTime.Sub(s.lastHeartbeat[s.backupLeaderID]) > HeartbeatTimeout
-
-	if leaderTimeout && !backupTimeout {
-		s.leaderID = s.backupLeaderID
-		s.backupLeaderID = 0
-		s.leaderAddress = s.backupLeaderAddress
-		s.backupLeaderAddress = ""
-		if s.id == s.leaderID {
-			s.role = "leader"
-		}
-	} else if leaderTimeout && backupTimeout {
-		time.Sleep(EmergencyElectionDelay)
-
-		s.currentEpoch++
-
-		s.epochStartTime = currentTime
-
-		s.role = "worker"
-
-		s.ParticipateInElection()
-	}
-}
-
-func (s *Server) Start() {
-	// Initialize and start the DESYNC server
-	s.mu.Lock()
-	s.done = false
-	s.role = "worker"
-	s.mu.Unlock()
-
-	s.restore()
-
-	rpcServer := rpc.NewServer()
-	rpcServer.Register(s)
-	l, err := net.Listen("tcp", s.address)
+	_ = persistState("/tmp/desync_state.gob", p)
+	restored, err := restoreState("/tmp/desync_state.gob")
 	if err != nil {
-		panic(err)
-	}
-	mux := http.NewServeMux()
-	mux.Handle(rpc.DefaultRPCPath, rpcServer)
-
-	s.server = &http.Server{Handler: mux}
-	go s.server.Serve(l)
-
-	// Determine startup path: genesis or join
-	if s.CheckGenesisConditions() {
-		s.HandleGenesisStartup()
+		fmt.Println("restore error:", err)
 	} else {
-		s.JoinExistingCluster()
+		fmt.Println("restored epoch:", restored.CurrentEpoch)
 	}
 
-	s.mu.Lock()
-	s.resetElectionTimeout()
-	s.mu.Unlock()
-
-	// Main event loop with ticker for periodic tasks
-	go func() {
-		ticker := time.NewTicker(HeartbeatInterval)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			s.mu.Lock()
-			if s.done {
-				s.mu.Unlock()
-				return
-			}
-			s.mu.Unlock()
-
-			currentPhase := s.GetCurrentPhase()
-			switch currentPhase {
-			case "processing":
-				s.mu.Lock()
-				if s.role == "leader" {
-					if s.ShouldCreateBatch() {
-						s.CreateAndDistributeBatches()
-					}
-					if s.AllBatchesCompleted() {
-						s.FinalizeBatchExecution()
-					}
-				}
-				s.mu.Unlock()
-
-				s.CheckForFailures()
-			case "election":
-				s.ParticipateInElection()
-			}
-
-			// Check for epoch transition
-			if time.Now().After(s.epochStartTime.Add(EpochDuration)) {
-				s.FinalizeElection()
-				s.epochStartTime = s.epochStartTime.Add(EpochDuration)
-				s.currentEpoch++
-			}
-
-			if s.role == "leader" || s.role == "backup_leader" {
-				s.SendHeartbeat()
-			}
+	// create fake transactions
+	txs := []Transaction{}
+	for i := 0; i < 10; i++ {
+		data := []byte(fmt.Sprintf("key%d:%d", i, i*10))
+		tx := Transaction{
+			TxData: data,
+			TxID: computeTxID(data),
+			BlockHeight: 100,
+			IndexInBlock: uint32(i),
 		}
-	}()
-}
+		txs = append(txs, tx)
+	}
 
-func (s *Server) GetCurrentPhase() string {
-	// Determine current phase: processing or election
-	currentTime := time.Now()
-
-	if currentTime.Before(s.epochStartTime.Add(ProcessingPhase)) {
-		return "processing"
-	} else if currentTime.Before(s.epochStartTime.Add(EpochDuration)) {
-		return "election"
-	} else {
-		return "transition"
+	ordered := orderTransactionsDeterministic(txs)
+	activeWorkers := []uint64{101, 102}
+	prevState := map[string][]byte{}
+	root, _, _ := computeStateRootFromMap(prevState)
+	batches := createSequentialBatches(ordered, activeWorkers, 4, 1, root)
+	fmt.Printf("Created %d batches\n", len(batches))
+	sm := &SimpleStateMachine{}
+	for _, b := range batches {
+		br, err := executeBatchWithDependencies(b, sm, prevState)
+		if err != nil {
+			fmt.Println("execute error:", err)
+			continue
+		}
+		fmt.Printf("Batch %d -> post_root %x\n", b.BatchID, br.PostStateRoot)
+		// verify receipt (very basic)
+		rec := Receipt{BatchID: br.BatchID, WorkerID: br.WorkerID, PostStateRoot: br.PostStateRoot}
+		ok, verr := verifyReceipt(rec, br.Proofs, prevState)
+		if ok {
+			fmt.Printf("Receipt verified for batch %d\n", b.BatchID)
+			// apply changes to prevState for next batch (simulate)
+			for _, p := range br.Proofs {
+				prevState[string(p.Key)] = append([]byte(nil), p.NewValue...)
+			}
+		} else {
+			fmt.Printf("Receipt verification failed: %v\n", verr)
+		}
 	}
 }
 
-func (s *Server) resetElectionTimeout() {
-	// Reset random election timeout (not directly used in DESYNC but for compatibility)
-	src := rand.NewSource(time.Now().UnixNano())
-	r := rand.New(src)
-	interval := time.Duration(r.Intn(s.heartbeatMs*2)+s.heartbeatMs*2) * time.Millisecond
-	s.electionTimeout = time.Now().Add(interval)
-}
+// End of file

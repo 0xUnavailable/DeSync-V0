@@ -1,445 +1,195 @@
 {
   "desync_specification": {
-    "version": "2.3",
+    "version": "3.1",
     "overview": {
-      "description": "DESYNC is a leader-worker consensus protocol for blockchain sequencing, using epochs for leadership rotation, VRF-based elections, PoS staking, and optimistic execution with fraud proofs. Leaders order transactions deterministically, workers execute in parallel with state synchronization, leader bundles to L1. Supports dynamic node joining after cluster initialization, processed at epoch boundaries."
+      "description": "DESYNC is an execution protocol that extends Tendermint by introducing a leader worker execution model with VRF-based leader election, parallel batch execution, and verifiable receipts. It ensures deterministic state transitions, supports fraud proofs, and enforces slashing for invalid behavior."
     },
     "constants": {
       "epoch_duration": "180s",
-      "processing_phase": "120s",
-      "election_phase": "60s",
-      "election_commit_period": "40s",
-      "election_reveal_period": "20s",
-      "heartbeat_interval": "100ms",
-      "heartbeat_timeout": "500ms",
-      "worker_execution_timeout": "30s",
-      "emergency_election_delay": "1s",
+      "commit_period": "30s",
+      "reveal_period": "30s",
       "max_batch_size": 1000,
-      "min_participation_threshold": "2/3",
-      "genesis_quorum_timeout": "10s",
-      "node_join_timeout": "10s"
+      "worker_execution_timeout": "30s",
+      "heartbeat_interval": "100ms"
+    },
+    "node_types": {
+      "client": {
+        "role": "Submit signed transactions via Tendermint RPC.",
+        "messages": [
+          "Transaction"
+        ]
+      },
+      "validator": {
+        "role": "Run Tendermint consensus + Desync ABCI app. Participate in VRF commit/reveal, verify receipts, finalize state root.",
+        "messages": [
+          "vrf_commit",
+          "vrf_reveal",
+          "Evidence",
+          "Transaction"
+        ]
+      },
+      "desync_abci": {
+        "role": "Batch creation, assignment to workers, receipt verification, commit of final AppHash to Tendermint.",
+        "functions": [
+          "CheckTx",
+          "DeliverTx",
+          "BeginBlock",
+          "EndBlock",
+          "Commit"
+        ]
+      },
+      "worker": {
+        "role": "Execute batches deterministically, produce receipts + proofs, sign results.",
+        "messages": [
+          "BatchAssignment",
+          "BatchResult",
+          "Receipt"
+        ]
+      },
+      "monitor": {
+        "role": "Verify receipts off-chain and submit fraud evidence if inconsistencies are found.",
+        "messages": [
+          "Evidence"
+        ]
+      }
     },
     "data_structures": {
-      "persistent_state": {
-        "current_epoch": { "type": "uint64", "description": "Current epoch number." },
-        "node_id": { "type": "uint64", "description": "This node's unique ID." },
-        "private_key": { "type": "byte_array", "description": "Node's VRF private key." },
-        "voted_hash_commit": { "type": "byte_array", "description": "Committed VRF hash (null if not committed)." },
-        "revealed_hash": { "type": "uint64", "description": "Revealed VRF hash (0 if not revealed)." },
-        "stake": { "type": "uint64", "description": "Staked tokens, subject to slashing." },
-        "state_root": { "type": "byte_array", "description": "Merkle root of current state." },
-        "genesis_config": {
-          "type": "GenesisConfig",
-          "description": "Genesis configuration for new cluster initialization.",
-          "fields": {
-            "cluster_members": {
-              "type": "array[ClusterMember]",
-              "description": "Initial set of nodes with IDs, addresses, public keys, and stakes."
-            },
-            "genesis_timestamp": {
-              "type": "uint64",
-              "description": "Microsecond timestamp for starting the first epoch."
-            },
-            "minimum_stake": {
-              "type": "uint64",
-              "description": "Minimum stake required for election participation."
-            },
-            "total_stake": {
-              "type": "uint64",
-              "description": "Sum of all initial stakes for quorum checks."
-            },
-            "epoch_duration": {
-              "type": "string",
-              "description": "Duration of each epoch (must match constants.epoch_duration)."
-            },
-            "bootstrap_nodes": {
-              "type": "array[string]",
-              "description": "List of trusted node addresses (hostname:port) for new nodes to contact for leader discovery and cluster joining."
-            }
+      "Transaction": {
+        "tx_id": "bytes",
+        "tx_data": "bytes",
+        "signature": "bytes",
+        "pubkey": "bytes",
+        "nonce": "uint64",
+        "gas_price": "uint64"
+      },
+      "Batch": {
+        "batch_id": "uint64",
+        "block_height": "uint64",
+        "sequence": "uint64",
+        "tx_hashes": [
+          "bytes"
+        ],
+        "prev_state_root": "bytes",
+        "worker_id": "uint64"
+      },
+      "BatchResult": {
+        "batch_id": "uint64",
+        "worker_id": "uint64",
+        "post_state_root": "bytes",
+        "proofs": [
+          {
+            "key": "bytes",
+            "old_value": "bytes",
+            "new_value": "bytes",
+            "merkle_proof": "bytes"
           }
+        ],
+        "execution_summary": {
+          "tx_count": "uint32",
+          "success_count": "uint32",
+          "gas_used": "uint64"
         },
-        "log": {
-          "type": "array[Entry]",
-          "entry": {
-            "epoch": { "type": "uint64" },
-            "index": { "type": "uint64" },
-            "tx_id": { "type": "byte_array" },
-            "tx_data": { "type": "byte_array" },
-            "timestamp": { "type": "uint64", "description": "Microsecond timestamp for ordering." },
-            "state_root": { "type": "byte_array", "description": "State root after this tx." }
-          },
-          "description": "Replicated log of ordered transactions with state transitions."
-        }
+        "signature": "bytes"
       },
-      "volatile_state_all": {
-        "commit_index": { "type": "uint64", "description": "Highest committed log index." },
-        "last_applied": { "type": "uint64", "description": "Highest applied log index." },
-        "role": { "type": "string", "description": "'leader', 'backup_leader', or 'worker'." },
-        "leader_id": { "type": "uint64", "description": "Current leader ID (null if unknown)." },
-        "backup_leader_id": { "type": "uint64", "description": "Current backup leader ID (null if unknown)." },
-        "epoch_start_time": { "type": "timestamp", "description": "PoH-verified epoch start." },
-        "cluster_members": { "type": "map[uint64: ClusterMember]", "description": "Known cluster state." },
-        "last_heartbeat": { "type": "map[uint64: timestamp]", "description": "Last heartbeat from leader and backup leader." }
+      "Receipt": {
+        "batch_id": "uint64",
+        "worker_id": "uint64",
+        "post_state_root": "bytes",
+        "signature": "bytes"
       },
-      "volatile_state_leader": {
-        "tx_pool": { "type": "map[tx_id: Transaction]", "description": "Pending transactions with arrival timestamps." },
-        "worker_batches": { "type": "map[worker_id: Batch]", "description": "Current batches assigned to workers." },
-        "worker_results": { "type": "map[worker_id: BatchResult]", "description": "Execution results from workers." },
-        "batch_sequence": { "type": "uint64", "description": "Next batch sequence number for ordering." },
-        "pending_join_requests": { "type": "map[node_id: JoinRequest]", "description": "Pending node join requests awaiting approval at epoch boundary." }
+      "Evidence": {
+        "reporter_id": "uint64",
+        "offending_receipt": "Receipt",
+        "counter_proof": {
+          "key": "bytes",
+          "correct_value": "bytes",
+          "merkle_proof": "bytes"
+        },
+        "timestamp_unix_ms": "int64",
+        "signature": "bytes"
       },
-      "volatile_state_worker": {
-        "current_batch": { "type": "Batch", "description": "Currently executing batch." },
-        "execution_state": { "type": "byte_array", "description": "Local execution state snapshot." },
-        "dependency_requests": { "type": "array[StateRequest]", "description": "Outstanding state dependency requests." }
+      "VRFCommit": {
+        "sender_id": "uint64",
+        "epoch": "uint64",
+        "hash_commit": "bytes",
+        "signature": "bytes"
       },
-      "cluster_member": {
-        "id": { "type": "uint64" },
-        "address": { "type": "string" },
-        "public_key": { "type": "byte_array", "description": "VRF public key." },
-        "stake": { "type": "uint64" },
-        "last_seen": { "type": "timestamp" }
-      },
-      "transaction": {
-        "tx_id": { "type": "byte_array", "description": "Hash of transaction data." },
-        "tx_data": { "type": "byte_array" },
-        "arrival_timestamp": { "type": "uint64", "description": "Microsecond timestamp when received by leader." },
-        "gas_price": { "type": "uint64", "description": "For MEV-resistant ordering." }
-      },
-      "batch": {
-        "batch_id": { "type": "uint64" },
-        "sequence": { "type": "uint64", "description": "Sequence number for ordering." },
-        "transactions": { "type": "array[Transaction]" },
-        "worker_id": { "type": "uint64" },
-        "created_timestamp": { "type": "timestamp" }
-      },
-      "batch_result": {
-        "batch_id": { "type": "uint64" },
-        "worker_id": { "type": "uint64" },
-        "execution_results": { "type": "array[ExecutionResult]" },
-        "new_state_root": { "type": "byte_array" },
-        "signature": { "type": "byte_array", "description": "Worker's signature on results." },
-        "execution_proof": { "type": "byte_array", "description": "Merkle proof of state transitions." }
-      },
-      "execution_result": {
-        "tx_id": { "type": "byte_array" },
-        "success": { "type": "boolean" },
-        "result_data": { "type": "byte_array" },
-        "gas_used": { "type": "uint64" },
-        "state_changes": { "type": "array[StateChange]", "description": "For dependency tracking." }
-      },
-      "state_change": {
-        "key": { "type": "byte_array", "description": "State key that was modified." },
-        "old_value": { "type": "byte_array" },
-        "new_value": { "type": "byte_array" }
-      },
-      "state_request": {
-        "requesting_worker": { "type": "uint64" },
-        "state_keys": { "type": "array[byte_array]", "description": "State keys needed for execution." },
-        "batch_id": { "type": "uint64" },
-        "timestamp": { "type": "timestamp" }
-      },
-      "join_request": {
-        "node_id": { "type": "uint64" },
-        "address": { "type": "string" },
-        "public_key": { "type": "byte_array" },
-        "stake": { "type": "uint64" },
-        "signature": { "type": "byte_array", "description": "Signature of node_id || address || public_key || stake." },
-        "timestamp": { "type": "timestamp" }
+      "VRFReveal": {
+        "sender_id": "uint64",
+        "epoch": "uint64",
+        "revealed_hash": "uint64",
+        "vrf_proof": "bytes"
       }
     },
-    "functions": {
-      "vrf_generate_hash": {
-        "signature": "vrfGenerateHash(seed: byte_array, private_key: byte_array) -> (hash: uint64, proof: byte_array)",
-        "description": "Generates verifiable random hash and proof."
-      },
-      "vrf_verify_hash": {
-        "signature": "vrfVerifyHash(hash: uint64, proof: byte_array, public_key: byte_array, seed: byte_array) -> boolean",
-        "description": "Verifies VRF hash was generated correctly."
-      },
-      "determine_leaders": {
-        "signature": "determineLeaders(revealed_hashes: map[node_id: (uint64, uint64)]) -> (leader_id: uint64, backup_id: uint64)",
-        "description": "Stakes-weighted selection: lowest weighted_hash = leader, second = backup. weighted_hash = hash / stake."
-      },
-      "poh_verify_time": {
-        "signature": "pohVerifyTime(tick_chain: byte_array, expected_duration: uint64) -> boolean",
-        "description": "Verifies PoH tick chain confirms time passage."
-      },
-      "compute_state_root": {
-        "signature": "computeStateRoot(state_changes: array[StateChange]) -> byte_array",
-        "description": "Computes merkle root of state after applying changes."
-      },
-      "verify_execution": {
-        "signature": "verifyExecution(tx: Transaction, result: ExecutionResult, proof: byte_array) -> boolean",
-        "description": "Verifies execution result using merkle proof."
-      },
-      "get_current_timestamp": {
-        "signature": "getCurrentTimestamp() -> uint64",
-        "description": "Returns current microsecond timestamp."
-      },
-      "compute_epoch_seed": {
-        "signature": "computeEpochSeed(epoch: uint64, genesis_timestamp: uint64 | null) -> byte_array",
-        "description": "Computes epoch seed. For epoch 1, uses sha256(genesis_timestamp || epoch); otherwise, uses PoH-based seed."
-      },
-      "verify_join_signature": {
-        "signature": "verifyJoinSignature(request: JoinRequest, public_key: byte_array) -> boolean",
-        "description": "Verifies the signature of a node join request."
-      }
+    "core_functions": {
+      "vrf_generate": "vrfGenerate(seed, private_key) -> (hash, proof)",
+      "vrf_verify": "vrfVerify(hash, proof, public_key, seed) -> bool",
+      "compute_state_root": "computeStateRoot(state_changes) -> bytes",
+      "verify_receipt": "verifyReceipt(receipt, proofs) -> bool",
+      "submit_evidence": "submitEvidence(evidence) -> bool"
     },
-    "methods": {
-      "accept_transaction": {
-        "signature": "acceptTransaction(tx_data: byte_array) -> tx_id",
-        "description": "Leader only: Receives transaction, assigns ID, records arrival timestamp with microsecond precision."
-      },
-      "order_transactions_deterministic": {
-        "signature": "orderTransactionsDeterministic() -> array[Transaction]",
-        "description": "Leader only: Orders transactions by (arrival_timestamp, tx_id) for deterministic ordering despite clock skew."
-      },
-      "create_sequential_batches": {
-        "signature": "createSequentialBatches(ordered_txs: array[Transaction]) -> map[worker_id: Batch]",
-        "description": "Leader only: Splits transactions into sequential batches (1-100 to worker1, 101-200 to worker2, etc.)."
-      },
-      "execute_batch_with_dependencies": {
-        "signature": "executeBatchWithDependencies(batch: Batch) -> BatchResult",
-        "description": "Worker only: Executes batch, requests state dependencies if needed, signs results with execution proof."
-      },
-      "request_state_dependency": {
-        "signature": "requestStateDependency(state_keys: array[byte_array], from_worker: uint64) -> StateResponse",
-        "description": "Worker only: Requests state from another worker for dependency resolution."
-      },
-      "resolve_execution_conflicts": {
-        "signature": "resolveExecutionConflicts(results: array[BatchResult]) -> array[BatchResult]",
-        "description": "Leader only: Orders batch results by sequence number, applies state changes sequentially."
-      },
-      "bundle_to_l1": {
-        "signature": "bundleToL1(finalized_results: array[BatchResult])",
-        "description": "Leader only: Creates rollup bundle with ordered transactions and state root for L1 submission."
-      },
-      "submit_fraud_proof": {
-        "signature": "submitFraudProof(disputed_tx_id: byte_array, correct_result: ExecutionResult, proof: byte_array)",
-        "description": "Any node: Submits fraud proof with correct execution result and merkle proof."
-      },
-      "validate_fraud_proof": {
-        "signature": "validateFraudProof(proof: FraudProof) -> boolean",
-        "description": "Validates fraud proof by re-executing transaction and comparing results."
-      },
-      "emergency_election": {
-        "signature": "emergencyElection()",
-        "description": "Triggers emergency election when both leader and backup are unresponsive."
-      },
-      "slash_stake": {
-        "signature": "slashStake(node_id: uint64, violation_type: string, evidence: byte_array)",
-        "description": "Slashes stake for violations: non_participation, false_execution, unresponsive."
-      },
-      "query_cluster_for_leader": {
-        "signature": "queryClusterForLeader() -> (leader_id: uint64, backup_leader_id: uint64, epoch: uint64)",
-        "description": "Queries cluster members to discover current leader, backup leader, and epoch."
-      },
-      "request_node_join": {
-        "signature": "requestNodeJoin(node_id: uint64, address: string, public_key: byte_array, stake: uint64, signature: byte_array) -> boolean",
-        "description": "New node requests to join the cluster; sent to leader for validation and approval."
-      },
-      "validate_node_join": {
-        "signature": "validateNodeJoin(request: JoinRequest) -> boolean",
-        "description": "Leader and workers validate a node join request; requires 2/3 stake approval."
-      },
-      "process_pending_joins": {
-        "signature": "processPendingJoins()",
-        "description": "Leader only: Processes pending join requests at epoch boundary after election."
-      }
-    },
-    "message_types": {
-      "heartbeat": {
-        "sender_id": { "type": "uint64" },
-        "epoch": { "type": "uint64" },
-        "role": { "type": "string" },
-        "timestamp": { "type": "timestamp" }
-      },
-      "batch_assignment": {
-        "batch": { "type": "Batch" },
-        "target_worker": { "type": "uint64" },
-        "sequence_number": { "type": "uint64" }
-      },
-      "batch_result_response": {
-        "result": { "type": "BatchResult" },
-        "target_leader": { "type": "uint64" }
-      },
-      "state_dependency_request": {
-        "request": { "type": "StateRequest" },
-        "target_worker": { "type": "uint64" }
-      },
-      "state_dependency_response": {
-        "state_data": { "type": "map[byte_array: byte_array]" },
-        "target_worker": { "type": "uint64" },
-        "request_id": { "type": "uint64" }
-      },
-      "vrf_commit": {
-        "sender_id": { "type": "uint64" },
-        "epoch": { "type": "uint64" },
-        "hash_commit": { "type": "byte_array" }
-      },
-      "vrf_reveal": {
-        "sender_id": { "type": "uint64" },
-        "epoch": { "type": "uint64" },
-        "revealed_hash": { "type": "uint64" },
-        "vrf_proof": { "type": "byte_array" }
-      },
-      "fraud_proof": {
-        "disputing_node": { "type": "uint64" },
-        "disputed_tx_id": { "type": "byte_array" },
-        "claimed_result": { "type": "ExecutionResult" },
-        "correct_result": { "type": "ExecutionResult" },
-        "execution_proof": { "type": "byte_array" },
-        "timestamp": { "type": "timestamp" }
-      },
-      "leader_info_response": {
-        "leader_id": { "type": "uint64" },
-        "backup_leader_id": { "type": "uint64" },
-        "epoch": { "type": "uint64" },
-        "sender_id": { "type": "uint64" }
-      },
-      "node_join_request": {
-        "request": { "type": "JoinRequest" },
-        "target_leader": { "type": "uint64" }
-      },
-      "node_join_approval": {
-        "node_id": { "type": "uint64" },
-        "approved": { "type": "boolean" },
-        "voter_id": { "type": "uint64" },
-        "signature": { "type": "byte_array" },
-        "timestamp": { "type": "timestamp" }
-      },
-      "cluster_member_update": {
-        "new_member": { "type": "ClusterMember" },
-        "total_stake": { "type": "uint64", "description": "Updated total stake of the cluster." },
-        "signature": { "type": "byte_array", "description": "Leader's signature on the update." }
-      }
+    "protocol_flow": {
+      "election": [
+        "Validators compute hash_commit and broadcast VRFCommit",
+        "Validators broadcast VRFReveal with revealed_hash + proof",
+        "All validators verify proofs and compute weighted_hash = revealed_hash / stake",
+        "Lowest weighted_hash = leader, second = backup_leader"
+      ],
+      "tx_submission": [
+        "Client signs and broadcasts Transaction to Tendermint RPC",
+        "Tendermint proposer includes txs in block",
+        "ABCI DeliverTx buffers txs in deterministic block order"
+      ],
+      "batch_execution": [
+        "Leader creates batches from blockTxList deterministically",
+        "Leader sends BatchAssignment to workers",
+        "Workers execute batches deterministically, compute post_state_root, produce proofs",
+        "Workers return BatchResult + Receipt"
+      ],
+      "verification_and_commit": [
+        "Leader verifies BatchResults using proofs",
+        "Leader applies state roots sequentially to derive FinalStateRoot",
+        "Leader commits FinalStateRoot as AppHash in ABCI Commit()",
+        "Tendermint finalizes block"
+      ],
+      "fraud_proof": [
+        "Any validator/monitor re-verifies BatchResults",
+        "If mismatch found, Evidence is submitted as DeliverTx",
+        "ABCI verifies counter_proof, slashes worker, and reassigns batch or re-executes"
+      ]
     },
     "rules": {
-      "all_nodes": [
-        "Maintain role based on election results",
-        "Use PoH to verify epoch timing and transitions",
-        "Participate in elections if staked (>= minimum_stake)",
-        "Monitor heartbeats: leader and backup must send every 100ms",
-        "Trigger emergency election if both leader and backup silent for >1s",
-        "Apply log entries sequentially: if commit_index > last_applied, apply next entry",
-        "Slash violations: non_participation (10%), unresponsiveness (5%), false_execution (25%)",
-        "Maintain cluster membership and stake tracking"
+      "determinism": "All workers must produce identical results given same inputs",
+      "slashing": "Workers producing invalid receipts lose stake",
+      "fraud_proofs": "Validators can challenge receipts with Evidence",
+      "timeouts": {
+        "leader_timeout": "If no heartbeat > heartbeat_interval * threshold, backup takes over",
+        "worker_timeout": "If no BatchResult by worker_execution_timeout, reassign batch"
+      }
+    },
+    "security": {
+      "byzantine_fault_tolerance": "Safe if < 1/3 workers or validators are Byzantine",
+      "proof_integrity": "SMT proofs guarantee state update correctness",
+      "liveness": "Leader rotation and Tendermint consensus ensure progress"
+    },
+    "implementation_priority": {
+      "P0": [
+        "VRF commit/reveal election",
+        "Deterministic batching (block.Tx order)",
+        "Worker execution + SMT proofs",
+        "Receipt verification in ABCI",
+        "Commit AppHash"
       ],
-      "node_initialization": [
-        "Always start as 'worker' (regardless of previous role)",
-        "Load genesis configuration if available",
-        "If genesis_config exists and current_epoch = 0 and current_time >= genesis_timestamp: initiate election for epoch 1 with staggered delay (node_id % 100ms)",
-        "If no genesis_config or current_epoch > 0: query cluster for current leader and epoch, initiate join process if in processing phase, or participate in election if in election phase",
-        "Start heartbeat timer (100ms) only if elected as leader or backup leader",
-        "Verify quorum (>= 2/3 stake) before proceeding with genesis election, retry after genesis_quorum_timeout (10s) if quorum not met"
+      "P1": [
+        "Slashing and staking registry",
+        "Fraud proof challenge flow",
+        "Worker registration and authentication"
       ],
-      "node_joining": [
-        "New node contacts bootstrap_nodes to query current leader using query_cluster_for_leader",
-        "New node sends node_join_request to leader with node_id, address, public_key, stake, and signature",
-        "Leader queues node_join_request in pending_join_requests and processes only at epoch boundary after election",
-        "Leader verifies stake (>= minimum_stake) and signature, broadcasts node_join_request to cluster for approval",
-        "Cluster members validate join request and respond with node_join_approval (2/3 stake approval required)",
-        "Leader broadcasts cluster_member_update at start of next epoch’s processing phase, adding new node to cluster_members",
-        "New node syncs state with leader and becomes active as worker at next epoch boundary",
-        "Limit join requests to one per node per epoch to prevent spam",
-        "If leader fails during join, new node retries with backup leader after node_join_timeout (10s)"
-      ],
-      "workers": [
-        "Receive batch assignments via direct message from leader",
-        "Execute batches deterministically using local state snapshot",
-        "Request state dependencies from other workers if conflicts detected",
-        "Sign execution results with merkle proof of state transitions",
-        "Return results to leader within execution timeout (30s)",
-        "Monitor leader/backup heartbeats, participate in emergency elections",
-        "Validate node_join_requests and send node_join_approval"
-      ],
-      "election_participants": [
-        "Commit VRF hash during first 40s of election phase",
-        "Reveal hash and proof during next 20s",
-        "Verify other nodes' reveals using vrf_verify_hash",
-        "Calculate weighted hashes: hash / stake for fair selection",
-        "Accept leader (lowest weighted hash) and backup (second lowest)",
-        "Require >= 2/3 participation for valid election",
-        "For epoch 1, use genesis_timestamp to compute epoch seed"
-      ],
-      "leaders": [
-        "Accept transactions with microsecond timestamp precision",
-        "Order transactions deterministically by (timestamp, tx_id)",
-        "Create sequential batches distributed across workers",
-        "Send batch assignments via direct messages",
-        "Collect signed execution results from workers",
-        "Resolve conflicts by applying batch results in sequence order",
-        "Bundle finalized transactions to L1 with state root",
-        "Send heartbeats every 100ms to all nodes",
-        "Claim proportional fees from processed transactions",
-        "Handoff state to new leader at epoch boundary",
-        "Queue node_join_requests and process at epoch boundary after election, coordinate approval"
-      ],
-      "backup_leaders": [
-        "Mirror leader's transaction pool and batch state",
-        "Ready to take over immediately if leader fails",
-        "Send heartbeats every 100ms",
-        "Monitor leader heartbeats and transaction flow",
-        "Validate node_join_requests and send node_join_approval"
+      "P2": [
+        "Operator tooling + SDKs",
+        "Performance optimization",
+        "Cross-rollup bundling"
       ]
-    },
-    "mev_resistance": {
-      "fair_ordering": "Deterministic ordering by arrival timestamp prevents leader manipulation",
-      "commit_reveal_batching": "Future enhancement: leaders commit to batch ordering before seeing all transactions",
-      "fee_distribution": "Leaders claim proportional fees, not full MEV extraction",
-      "rotation_frequency": "3-minute epochs limit any single leader's MEV extraction window"
-    },
-    "fault_tolerance": {
-      "byzantine_model": "Assumes <= 1/3 Byzantine nodes in total cluster",
-      "leader_failure": "Backup takes over immediately, no election needed",
-      "dual_failure": "Emergency election with 1s delay if both leader and backup fail",
-      "network_partitions": "Majority partition continues, minority partitions halt",
-      "state_inconsistency": "Fraud proofs allow challenges to incorrect execution",
-      "crash_recovery": "Restart as 'worker', reload persistent state, sync with current leader, participate in next election if desired, never assumes previous leadership role",
-      "clock_synchronization": "PoH provides common time reference, microsecond timestamps handle skew",
-      "node_join_failure": "If leader fails during join, new node retries with backup leader; unapproved nodes retry in next epoch"
-    },
-    "fraud_proof_system": {
-      "dispute_window": "24 hours to challenge any execution result",
-      "proof_requirements": "Must provide correct execution result with merkle proof",
-      "validation_process": "Any node can validate by re-executing disputed transaction",
-      "penalties": "25% stake slashing for proven false execution",
-      "incentives": "Successful challengers receive portion of slashed stake"
-    },
-    "implementation_phases": {
-      "phase_1_mvp": [
-        "Basic VRF election with commit-reveal",
-        "Leader-worker direct messaging (no gossip yet)",
-        "Simple sequential batching",
-        "Deterministic transaction ordering",
-        "Basic heartbeat monitoring",
-        "Genesis configuration loading and initial election",
-        "Basic node joining with leader validation and epoch-boundary processing"
-      ],
-      "phase_2_optimization": [
-        "State dependency resolution between workers",
-        "Fraud proof system implementation",
-        "L1 integration with rollup bundling",
-        "Slashing mechanism activation",
-        "Cluster-wide node join approval"
-      ],
-      "phase_3_production": [
-        "Gossip protocol for scalability",
-        "Advanced MEV resistance features",
-        "Cross-rollup interoperability",
-        "Performance optimizations",
-        "Optimized node joining with L1 stake verification"
-      ]
-    },
-    "security_considerations": {
-      "sybil_resistance": "PoS staking requirement + VRF prevents identity manipulation",
-      "election_manipulation": "VRF commit-reveal + stake weighting prevents hash grinding",
-      "execution_integrity": "Signed results + fraud proofs ensure correctness",
-      "availability": "Backup leader + emergency elections ensure liveness",
-      "censorship_resistance": "Short epochs + deterministic ordering limit censorship window",
-      "genesis_security": "Genesis configuration must be securely distributed and verified (e.g., via L1 contract or trusted setup)",
-      "node_join_security": "Require 2/3 stake approval and signed join requests at epoch boundaries to prevent malicious joins"
     }
   }
 }
