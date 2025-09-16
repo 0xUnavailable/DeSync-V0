@@ -1,220 +1,241 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 )
 
-// helper: clear DB dir and reopen
-func resetTestDB(t testing.TB, path string) *StateDB {
+// ----------------- Pools -----------------
+
+var kvResultPool = sync.Pool{
+	New: func() any {
+		return make([]KVResult, 0, 1024)
+	},
+}
+
+// ----------------- Helpers -----------------
+
+func resetTestDBBench(path string) *StateDB {
 	_ = os.RemoveAll(path)
 	db, err := NewStateDB(path)
 	if err != nil {
-		t.Fatalf("NewStateDB failed: %v", err)
+		panic(fmt.Sprintf("NewStateDB failed: %v", err))
 	}
 	return db
 }
 
-// wrapper: run a batch in staging mode and return changes
-func executeBatchStaged(b Batch, sm *SimpleStateMachine) (map[string][]byte, error) {
-	// DB is not needed in staging mode → pass nil
-	br, err := executeBatchWithDependencies(nil, b, sm, nil)
+func ensureTxDataJSONBench(filePath string, totalTx int) []Transaction {
+	if _, err := os.Stat(filePath); err == nil {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			panic(fmt.Sprintf("read %s failed: %v", filePath, err))
+		}
+		var txs []Transaction
+		if err := json.Unmarshal(data, &txs); err != nil {
+			panic(fmt.Sprintf("unmarshal %s failed: %v", filePath, err))
+		}
+		if len(txs) >= totalTx {
+			return txs[:totalTx]
+		}
+	}
+	txs := make([]Transaction, 0, totalTx)
+	for i := 0; i < totalTx; i++ {
+		data := []byte(fmt.Sprintf("tx%d:%d", i, i*31))
+		tx := Transaction{
+			TxData:       data,
+			TxID:         computeTxID(data),
+			BlockHeight:  0,
+			IndexInBlock: uint32(i),
+		}
+		txs = append(txs, tx)
+	}
+	enc, _ := json.MarshalIndent(txs, "", "  ")
+	_ = os.WriteFile(filePath, enc, 0644)
+	return txs
+}
+
+func writeCSVResult(file string, record []string) {
+	f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return nil, err
+		log.Fatalf("open csv failed: %v", err)
 	}
-	return br.Changes, nil
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+	_ = w.Write(record)
 }
 
+// ----------------- Core Runner -----------------
 
-// TestStagedDeterministicExecution simulates nodes processing batches with staging + merge
-func TestStagedDeterministicExecution(t *testing.T) {
-	dbPath := "./test_desync_staging"
-	db := resetTestDB(t, dbPath)
-	defer db.Close()
-
-	// Create 100 batches × 100 txs = 10,000 txs
-	totalTx := 10000
-	txs := make([]Transaction, 0, totalTx)
-	for i := 0; i < totalTx; i++ {
-		data := []byte(fmt.Sprintf("k%d:%d", i, i*11))
-		tx := Transaction{
-			TxData:       data,
-			TxID:         computeTxID(data),
-			BlockHeight:  1,
-			IndexInBlock: uint32(i),
-		}
-		txs = append(txs, tx)
-	}
-	ordered := orderTransactionsDeterministic(txs)
-
-	activeWorkers := make([]uint64, 100)
-	for i := 0; i < 100; i++ {
-		activeWorkers[i] = uint64(2000 + i)
+func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, workers int) {
+	if _, err := os.Stat(csvFile); os.IsNotExist(err) {
+		writeCSVResult(csvFile, []string{"totalTx", "blockTx", "batchSize", "workers", "elapsed_ms", "TPS"})
 	}
 
-	prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
-	batches := createSequentialBatches(ordered, activeWorkers, 100, 1, prevRoot)
-	if len(batches) != 100 {
-		t.Fatalf("expected 100 batches, got %d", len(batches))
+	allTxs := ensureTxDataJSONBench(fmt.Sprintf("bench_%d.json", totalTx), totalTx)
+	workerIDs := make([]uint64, workers)
+	for i := range workerIDs {
+		workerIDs[i] = uint64(5000 + i)
 	}
 
-	// --- Stage execution ---
-	workerChanges := make([]map[string][]byte, len(batches))
-	var wg sync.WaitGroup
-	start := time.Now()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db := resetTestDBBench(fmt.Sprintf("./bench_db_%d", totalTx))
+		defer db.Close()
 
-	for i, b := range batches {
-		wg.Add(1)
-		go func(idx int, batch Batch) {
-			defer wg.Done()
-			staging := make(map[string][]byte)
-			sm := NewStagingStateMachine(staging)
-			ch, err := executeBatchStaged(batch, sm)
+		prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
+		totalBlocks := totalTx / blockTx
+		startChain := time.Now()
+
+		for blk := 0; blk < totalBlocks; blk++ {
+			blockTxs := allTxs[blk*blockTx : (blk+1)*blockTx]
+			for i := range blockTxs {
+				blockTxs[i].BlockHeight = uint64(blk + 1)
+			}
+
+			ordered := orderTransactionsDeterministic(blockTxs)
+			batches := createSequentialBatches(ordered, workerIDs, batchSize, uint64(blk+1), prevRoot)
+
+			workerResults := make([][]KVResult, len(batches))
+			var wg sync.WaitGroup
+			for bi, batch := range batches {
+				wg.Add(1)
+				go func(idx int, b Batch) {
+					defer wg.Done()
+					buf := kvResultPool.Get().([]KVResult)[:0]
+					results := workerExecute(b)
+					buf = append(buf, results...)
+					workerResults[idx] = buf
+					kvResultPool.Put(buf)
+				}(bi, batch)
+			}
+			wg.Wait()
+
+			merged := mergeResultsOrdered(workerResults)
+			if err := applyResultsOrdered(db, merged); err != nil {
+				b.Fatalf("applyResultsOrdered failed: %v", err)
+			}
+
+			root, err := computeStateRootFromDB(db)
 			if err != nil {
-				t.Errorf("worker %d error: %v", idx, err)
-				return
+				b.Fatalf("computeStateRootFromDB failed: %v", err)
 			}
-			workerChanges[idx] = ch
-		}(i, b)
-	}
-	wg.Wait()
-
-	// --- Deterministic merge ---
-	merged := make(map[string][]byte)
-	for _, ch := range workerChanges {
-		for k, v := range ch {
-			merged[k] = v
+			prevRoot = root
 		}
-	}
-	if err := applyChangesToDB(db, merged); err != nil {
-		t.Fatalf("applyChangesToDB failed: %v", err)
-	}
 
-	root, _ := computeStateRootFromDB(db)
-	elapsed := time.Since(start)
+		elapsed := time.Since(startChain)
+		tps := float64(totalTx) / elapsed.Seconds()
 
-	if len(root) == 0 {
-		t.Fatalf("final root is empty")
-	}
+		b.ReportMetric(tps, "tx/s")
+		b.Logf("[%s] %d tx → elapsed=%s, TPS=%.2f, finalRoot=%s",
+			csvFile, totalTx, elapsed, tps, hex.EncodeToString(prevRoot),
+		)
 
-	if err := db.DumpToJSON("staging_state_dump.json"); err != nil {
-		t.Fatalf("DumpToJSON failed: %v", err)
+		writeCSVResult(csvFile, []string{
+			fmt.Sprintf("%d", totalTx),
+			fmt.Sprintf("%d", blockTx),
+			fmt.Sprintf("%d", batchSize),
+			fmt.Sprintf("%d", workers),
+			fmt.Sprintf("%.2f", float64(elapsed.Milliseconds())),
+			fmt.Sprintf("%.2f", tps),
+		})
 	}
-
-	t.Logf("Staged deterministic execution: %d batches, %d txs, elapsed=%s, root=%s",
-		len(batches), totalTx, elapsed, hex.EncodeToString(root))
-}
-// --- Benchmarks ---
-
-var benchmarkBatches []Batch
-
-// prepare shared batch data once
-func prepareBenchmarkBatches(b *testing.B) {
-	if len(benchmarkBatches) > 0 {
-		return
-	}
-	totalTx := 10000
-	txs := make([]Transaction, 0, totalTx)
-	for i := 0; i < totalTx; i++ {
-		data := []byte(fmt.Sprintf("bm_k%d:%d", i, i*17))
-		tx := Transaction{
-			TxData:       data,
-			TxID:         computeTxID(data),
-			BlockHeight:  1,
-			IndexInBlock: uint32(i),
-		}
-		txs = append(txs, tx)
-	}
-	ordered := orderTransactionsDeterministic(txs)
-	activeWorkers := make([]uint64, 100)
-	for i := 0; i < 100; i++ {
-		activeWorkers[i] = uint64(5000 + i)
-	}
-	prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
-	benchmarkBatches = createSequentialBatches(ordered, activeWorkers, 100, 1, prevRoot)
 }
 
-// --- Accumulating DB ---
-func BenchmarkStagedParallel_Accumulating(b *testing.B) {
-	prepareBenchmarkBatches(b)
-	dbPath := "./bench_desync_parallel_acc"
-	db := resetTestDB(b, dbPath)
-	defer db.Close()
+// ----------------- Benchmarks -----------------
 
-	for n := 0; n < b.N; n++ {
+func BenchmarkScalingUnconstrained(b *testing.B) {
+	cases := []struct {
+		totalTx   int
+		blockTx   int
+		batchSize int
+		workers   int
+	}{
+		{20_000, 5_000, 200, 5},
+		{200_000, 20_000, 500, 10},
+		{1_000_000, 25_000, 500, 20},
+	}
+	for _, c := range cases {
+		b.Run(fmt.Sprintf("%dtx_unconstrained", c.totalTx), func(b *testing.B) {
+			runScalingCase(b, "scaling_unconstrained.csv", c.totalTx, c.blockTx, c.batchSize, c.workers)
+		})
+	}
+}
+
+func BenchmarkScalingConstrained(b *testing.B) {
+	cases := []struct {
+		totalTx   int
+		blockTx   int
+		batchSize int
+		workers   int
+	}{
+		{20_000, 5_000, 200, 5},
+		{200_000, 20_000, 500, 10},
+		{1_000_000, 25_000, 500, 20},
+	}
+	for _, c := range cases {
+		b.Run(fmt.Sprintf("%dtx_constrained", c.totalTx), func(b *testing.B) {
+			runScalingCase(b, "scaling_constrained.csv", c.totalTx, c.blockTx, c.batchSize, c.workers)
+		})
+	}
+}
+
+// ----------------- Parallel Fraction Test -----------------
+
+func TestMeasureParallelFraction(t *testing.T) {
+	totalTx := 500_000
+	coresToTest := []int{1, 2, 4, 8, 16, 32, 64}
+	times := make(map[int]float64)
+
+	// Prepare transactions
+	txs := ensureTxDataJSONBench("pf_txs.json", totalTx)
+
+	for _, n := range coresToTest {
+		runtime.GOMAXPROCS(n)
 		start := time.Now()
-		workerChanges := make([]map[string][]byte, len(benchmarkBatches))
+
+		// Single block execution (simulate intra-node execution)
+		db := resetTestDBBench(fmt.Sprintf("./pf_db_%d", n))
+		defer db.Close()
+		ordered := orderTransactionsDeterministic(txs)
+		batches := createSequentialBatches(ordered, []uint64{1}, 1000, 1, []byte{})
+
 		var wg sync.WaitGroup
-		for i, batch := range benchmarkBatches {
+		for _, batch := range batches {
 			wg.Add(1)
-			go func(idx int, b Batch) {
+			go func(b Batch) {
 				defer wg.Done()
-				staging := make(map[string][]byte)
-				sm := NewStagingStateMachine(staging)
-				ch, _ := executeBatchStaged(b, sm)
-				workerChanges[idx] = ch
-			}(i, batch)
+				_ = workerExecute(b)
+			}(batch)
 		}
 		wg.Wait()
 
-		merged := make(map[string][]byte)
-		for _, ch := range workerChanges {
-			for k, v := range ch {
-				merged[k] = v
-			}
-		}
-		_ = applyChangesToDB(db, merged)
-		root, _ := computeStateRootFromDB(db)
-
-		elapsed := time.Since(start)
-		b.ReportMetric(float64(len(benchmarkBatches))/elapsed.Seconds(), "batches/s")
-		b.ReportMetric(float64(10000)/elapsed.Seconds(), "tx/s")
-		b.Logf("[Accum] iter=%d elapsed=%s root=%x", n, elapsed, root)
+		elapsed := time.Since(start).Seconds()
+		times[n] = elapsed
+		t.Logf("Cores=%d, Time=%.4fs", n, elapsed)
 	}
-}
 
-// --- Resetting DB Each Iter ---
-func BenchmarkStagedParallel_ResetEach(b *testing.B) {
-	prepareBenchmarkBatches(b)
+	// Derive p from Amdahl’s law
+	T1 := times[1]
+	file := "parallel_fraction.csv"
+	writeCSVResult(file, []string{"cores", "time_s", "p"})
 
-	for n := 0; n < b.N; n++ {
-		dbPath := fmt.Sprintf("./bench_desync_parallel_reset_%d", n)
-		db := resetTestDB(b, dbPath)
-
-		start := time.Now()
-		workerChanges := make([]map[string][]byte, len(benchmarkBatches))
-		var wg sync.WaitGroup
-		for i, batch := range benchmarkBatches {
-			wg.Add(1)
-			go func(idx int, b Batch) {
-				defer wg.Done()
-				staging := make(map[string][]byte)
-				sm := NewStagingStateMachine(staging)
-				ch, _ := executeBatchStaged(b, sm)
-				workerChanges[idx] = ch
-			}(i, batch)
-		}
-		wg.Wait()
-
-		merged := make(map[string][]byte)
-		for _, ch := range workerChanges {
-			for k, v := range ch {
-				merged[k] = v
-			}
-		}
-		_ = applyChangesToDB(db, merged)
-		root, _ := computeStateRootFromDB(db)
-
-		elapsed := time.Since(start)
-		b.ReportMetric(float64(len(benchmarkBatches))/elapsed.Seconds(), "batches/s")
-		b.ReportMetric(float64(10000)/elapsed.Seconds(), "tx/s")
-		b.Logf("[Reset] iter=%d elapsed=%s root=%x", n, elapsed, root)
-
-		db.Close()
-		_ = os.RemoveAll(dbPath) // cleanup after each iteration
+	for _, n := range coresToTest[1:] {
+		Tn := times[n]
+		p := (T1 - Tn) / (T1 * (1 - 1/float64(n)))
+		writeCSVResult(file, []string{
+			fmt.Sprintf("%d", n),
+			fmt.Sprintf("%.4f", Tn),
+			fmt.Sprintf("%.4f", p),
+		})
+		t.Logf("Derived p at %d cores = %.4f", n, p)
 	}
 }
