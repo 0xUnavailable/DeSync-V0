@@ -63,7 +63,7 @@ This file tracks **development milestones**, **design choices**, and **next step
    * Next step: **static key-sharding** (`hash(key) % N`).
    * Removes conflicts → ensures deterministic results.
 
-3. **Incremental Merkle Tree**
+3. **Incremental Merkle Tree** ---- (IN PROGRESS SPARKLE MERKLE TREE + LEVELS DB)
 
    * Replace `IterateAll` with IAVL or Sparse Merkle.
    * Enables O(log n) updates + efficient proofs.

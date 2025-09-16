@@ -1,4 +1,3 @@
-
 # DESYNC Protocol
 
 DESYNC is a **next-generation execution-layer protocol** designed for **deterministic transaction ordering, parallelized batch execution, and verifiable state transitions**.  
@@ -11,13 +10,25 @@ Unlike traditional blockchain systems where ordering and execution are tightly c
 
 We started from a basic prototype and incrementally implemented key features:
 
+- [x] **Modularized codebase**  
+   - Core logic split into files (`types.go`, `statedb.go`, `merkle.go`, `execution.go`, etc.).  
+   - Easier maintainability and testing.  
+
 - [x] **Deterministic transaction ordering**  
    - Transactions sorted by `(BlockHeight, IndexInBlock, TxID)`.  
-   - Preserves consistent output regardless of worker scheduling.  
+   - Ensures identical commit order across all nodes.  
+
+- [x] **Deterministic merge ordering**  
+   - All worker results merged by sorted keys before commit.  
+   - Prevents nondeterminism from Go map iteration order.  
 
 - [x] **Parallel batch execution with sync.Pool optimizations**  
    - Workers execute batches independently, results merged deterministically.  
    - Reduced allocation overhead via `sync.Pool`.  
+
+- [x] **Intra-node parallel execution**  
+   - Batches subdivided across CPU cores.  
+   - Deterministic sorting ensures identical results across runs.  
 
 - [x] **Merkle state root computation**  
    - Each block commits a deterministic Merkle root.  
@@ -25,17 +36,10 @@ We started from a basic prototype and incrementally implemented key features:
 
 - [x] **Execution pipeline testing + benchmarking**  
    - Integrated Go benchmarks measuring TPS, allocations, memory usage.  
-   - Scaling tests simulate 20k → 200k → 2M transactions.  
+   - Deterministic test ensures all nodes/cores produce the same state root.  
 
 - [x] **Scaling experiments**  
    - Achieved **~1.4M TPS** (1M transactions in <700ms) in local benchmarks.  
-
-- [x] **Intra-node parallel execution**  
-   - Beyond worker pools: batches are subdivided across CPU cores.  
-   - Two strategies:  
-     - Static partitioning → split evenly across cores.  
-     - Work stealing → dynamic balancing between cores.  
-   - Fully utilizes multicore CPUs, similar to PVM (Parallel Virtual Machine).  
 
 ---
 
@@ -84,15 +88,14 @@ $$
 
 | p (parallel fraction) | Cores | Speedup | TPS (base 10k) |
 | --------------------- | ----- | ------- | -------------- |
-| 0.5                   | 1     | 1.0     | 10,000         |
 | 0.5                   | 16    | 1.88    | 18,823         |
 | 0.7                   | 16    | 2.90    | 29,090         |
 | 0.9                   | 16    | 6.40    | 64,000         |
 
 🔹 With **p=0.5 (50% parallel)** → diminishing returns after \~4 cores.
-🔹 With **p=0.9 (90% parallel)** → scaling is almost linear up to many cores.
+🔹 With **p=0.9 (90% parallel)** → scaling is nearly linear.
 
-**Observation:** Intra-node execution shows slightly higher TPS than worker-only execution. Gains flatten beyond 5–20 workers/cores, where sequential bottlenecks (DB writes, state merges) dominate.
+**Observation:** Intra-node execution achieves higher TPS than worker-only execution. Gains flatten beyond 20 workers/cores, where sequential bottlenecks (DB writes, state merges) dominate.
 
 ---
 
@@ -103,6 +106,7 @@ $$
 * **Batched DB writes** → drastically reduces I/O overhead.
 * **Sync pools** → pooled slices/maps minimize allocations.
 * **Benchmark suite** → TPS, allocations, and throughput measured under different loads.
+* **Proof system** → inclusion proofs from Merkle roots for verifiable state.
 
 ---
 
@@ -131,6 +135,12 @@ Run with memory stats:
 go test -bench=. -benchmem -run=^$ -v
 ```
 
+Run **deterministic test**:
+
+```bash
+go test -v -run TestDeterministicExecution
+```
+
 Run **full execution pipeline test**:
 
 ```bash
@@ -140,14 +150,9 @@ go test -v -run TestFullExecutionPipeline -bench=. -benchmem
 Example:
 
 ```
-=== RUN   TestFullExecutionPipeline
-    ✅ 1,000,000 tx → 10 batches (100 workers, batchSize=10000)
-    Elapsed: 686.9ms
-    Throughput: 1,455,731 tx/s
-    Final state root: 34dc92c917c2...
---- PASS: TestFullExecutionPipeline (1.02s)
-BenchmarkExecutionPipeline
-BenchmarkExecutionPipeline-4   	       2	 680161478 ns/op	353 MB/op	2.1M allocs/op
+=== RUN   TestDeterministicExecution
+    🎉 All configurations and runs produced the same final root: 2c3697500a11c903...
+--- PASS: TestDeterministicExecution (2.1s)
 ```
 
 ---
@@ -188,18 +193,26 @@ sequenceDiagram
     Coordinator->>Coordinator: Lowest Beta → Leader
 ```
 
+---
 
 ## 📂 Repository Structure
 
 ```
 .
-├── desync.go                  # Core protocol implementation
-├── desync_test.go             # Benchmarks (workers + intra-node execution)
+├── types.go                  # Core types (Transaction, Batch, Receipt, etc.)
+├── statedb.go                # LevelDB-backed state database
+├── merkle.go                 # Merkle tree + proofs
+├── execution.go              # State machine + batch execution
+├── workers.go                # Worker + intra-node execution
+├── utils.go                  # Helpers (hashing, sorting, etc.)
+├── main.go                   # Demo runner
+├── desync_test.go            # Deterministic + scaling benchmarks
 ├── scaling_unconstrained.csv
 ├── scaling_constrained.csv
 ├── scaling_intra.csv
 ├── plot_scaling_comparison.py # Benchmark visualization
-└── README.md                  # This file
+├── README.md                 # This file
+└── PROGRESS.md               # Running implementation log
 ```
 
 ---
@@ -210,10 +223,11 @@ sequenceDiagram
 DESYNC prototype (intra-node update). Demo run...
 Created 3 batches
 Batch 1 → post_root 7e1b4c...
-Receipt verified
 Batch 2 → post_root 9a3d12...
-Receipt verified
 Batch 3 → post_root 6b42f8...
-Receipt verified
+Final root after merged commit: 2c3697500a11c903...
 ```
+
+```
+
 
