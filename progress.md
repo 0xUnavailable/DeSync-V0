@@ -54,7 +54,7 @@ This file tracks **development milestones**, **design choices**, and **next step
 
 ##  Work in Progress
 
-1. **Deterministic Merge Order**  --- in progress
+1. **Deterministic Merge Order**  --- DONE
 
    * Hardening: all DB commits sorted by key.
 

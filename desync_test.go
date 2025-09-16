@@ -239,3 +239,110 @@ func TestMeasureParallelFraction(t *testing.T) {
 		t.Logf("Derived p at %d cores = %.4f", n, p)
 	}
 }
+
+
+// ----------------- Deterministic Test -----------------
+
+func TestDeterministicExecution(t *testing.T) {
+	totalTx := 50_000
+	blockTx := 5_000
+	batchSize := 500
+
+	// Prepare transactions
+	txs := ensureTxDataJSONBench("deterministic_txs.json", totalTx)
+
+	// Configurations to test determinism
+	configs := []struct {
+		name    string
+		workers int
+		cores   int
+	}{
+		{"single_worker_single_core", 1, 1},
+		{"multi_worker_single_core", 5, 1},
+		{"multi_worker_multi_core", 10, runtime.NumCPU()},
+	}
+
+	// Run each config multiple times to catch nondeterminism
+	runsPerConfig := 3
+	finalRoots := make(map[string][]string)
+
+	for _, cfg := range configs {
+		for run := 1; run <= runsPerConfig; run++ {
+			runName := fmt.Sprintf("%s_run%d", cfg.name, run)
+			t.Run(runName, func(t *testing.T) {
+				runtime.GOMAXPROCS(cfg.cores)
+
+				db := resetTestDBBench(fmt.Sprintf("./deterministic_db_%s", runName))
+				defer db.Close()
+
+				workerIDs := make([]uint64, cfg.workers)
+				for i := range workerIDs {
+					workerIDs[i] = uint64(6000 + i)
+				}
+
+				prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
+				totalBlocks := totalTx / blockTx
+
+				for blk := 0; blk < totalBlocks; blk++ {
+					blockTxs := txs[blk*blockTx : (blk+1)*blockTx]
+					for i := range blockTxs {
+						blockTxs[i].BlockHeight = uint64(blk + 1)
+					}
+
+					ordered := orderTransactionsDeterministic(blockTxs)
+					batches := createSequentialBatches(ordered, workerIDs, batchSize, uint64(blk+1), prevRoot)
+
+					workerResults := make([][]KVResult, len(batches))
+					var wg sync.WaitGroup
+					for bi, batch := range batches {
+						wg.Add(1)
+						go func(idx int, b Batch) {
+							defer wg.Done()
+							results := workerExecute(b) // deterministic worker execution
+							workerResults[idx] = results
+						}(bi, batch)
+					}
+					wg.Wait()
+
+					merged := mergeResultsOrdered(workerResults)
+					if err := applyResultsOrdered(db, merged); err != nil {
+						t.Fatalf("applyResultsOrdered failed: %v", err)
+					}
+
+					root, err := computeStateRootFromDB(db)
+					if err != nil {
+						t.Fatalf("computeStateRootFromDB failed: %v", err)
+					}
+					prevRoot = root
+				}
+
+				finalRootHex := hex.EncodeToString(prevRoot)
+				finalRoots[cfg.name] = append(finalRoots[cfg.name], finalRootHex)
+				t.Logf("Config %s (run %d) → Final Root: %s", cfg.name, run, finalRootHex)
+			})
+		}
+	}
+
+	// Validate determinism:
+	// 1. All runs within each config must match
+	// 2. All configs must match each other
+	var referenceRoot string
+	for cfg, roots := range finalRoots {
+		first := roots[0]
+		for _, r := range roots {
+			if r != first {
+				t.Fatalf("nondeterminism detected within config %s: %v", cfg, roots)
+			}
+		}
+		t.Logf("✅ Config %s is deterministic across %d runs", cfg, runsPerConfig)
+
+		if referenceRoot == "" {
+			referenceRoot = first
+		} else if first != referenceRoot {
+			t.Fatalf("nondeterminism detected between configs: expected %s, got %s for config %s",
+				referenceRoot, first, cfg)
+		}
+	}
+
+	t.Logf("🎉 All configurations and runs produced the same final root: %s", referenceRoot)
+}

@@ -17,16 +17,16 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/gob"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
-	"runtime"
 
 	"github.com/ProtonMail/go-ecvrf/ecvrf"
 	"github.com/syndtr/goleveldb/leveldb"
@@ -204,22 +204,33 @@ func (s *StateDB) GetRoot(blockHeight uint64) ([]byte, error) {
 	return v, err
 }
 
+// DumpToJSON now deterministic: sorted keys -> ordered array of {key,value}
 func (s *StateDB) DumpToJSON(filename string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	result := make(map[string]string)
 	iter := s.db.NewIterator(nil, nil)
 	defer iter.Release()
+
+	kvs := make(map[string]string)
+	keys := make([]string, 0)
 	for iter.Next() {
 		k := string(iter.Key())
 		v := iter.Value()
-		result[k] = hex.EncodeToString(v)
+		kvs[k] = hex.EncodeToString(v)
+		keys = append(keys, k)
 	}
 	if err := iter.Error(); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(result, "", "  ")
+	sort.Strings(keys)
+
+	ordered := make([]map[string]string, 0, len(keys))
+	for _, k := range keys {
+		ordered = append(ordered, map[string]string{"key": k, "value": kvs[k]})
+	}
+
+	data, err := json.MarshalIndent(ordered, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -439,6 +450,11 @@ func vrfVerifyHash(hash []byte, proof []byte, publicKeyBytes []byte, seed []byte
 // ---------------------------
 
 func verifyReceipt(r Receipt, proofs []Proof, prevState map[string][]byte) (bool, error) {
+	// sort proofs deterministically by key to defend against out-of-order proofs
+	sort.Slice(proofs, func(i, j int) bool {
+		return string(proofs[i].Key) < string(proofs[j].Key)
+	})
+
 	tmp := make(map[string][]byte)
 	for k, v := range prevState {
 		tmp[k] = append([]byte(nil), v...)
@@ -594,7 +610,10 @@ func executeBatchStaged(b Batch, sm *SimpleStateMachine) (map[string][]byte, err
 		return map[string][]byte{}, nil
 	}
 	out := make(map[string][]byte, len(sm.Staging))
-	for k, v := range sm.Staging {
+	// iterate staging deterministically when copying (not strictly required, but explicit)
+	keys := sortedKeysFromMap(sm.Staging)
+	for _, k := range keys {
+		v := sm.Staging[k]
 		c := make([]byte, len(v))
 		copy(c, v)
 		out[k] = c
@@ -607,6 +626,7 @@ func executeBatchWithDependencies(db *StateDB, b Batch, sm StateMachine, prevSta
 	var res BatchResult
 	res.BatchID = b.BatchID
 	res.WorkerID = b.WorkerID
+	res.Changes = make(map[string][]byte)
 
 	changes := make(map[string][]byte)
 	var txCount, successCount uint32
@@ -648,9 +668,17 @@ func executeBatchWithDependencies(db *StateDB, b Batch, sm StateMachine, prevSta
 		} else {
 			dbState = make(map[string][]byte)
 		}
+		// merge staging deterministically by sorted keys
 		ssm := sm.(*SimpleStateMachine)
-		for k, v := range ssm.Staging {
-			dbState[k] = v
+		if len(ssm.Staging) > 0 {
+			stKeys := sortedKeysFromMap(ssm.Staging)
+			for _, k := range stKeys {
+				// copy to avoid aliasing
+				v := ssm.Staging[k]
+				c := make([]byte, len(v))
+				copy(c, v)
+				dbState[k] = c
+			}
 		}
 		m = dbState
 	} else {
@@ -665,7 +693,10 @@ func executeBatchWithDependencies(db *StateDB, b Batch, sm StateMachine, prevSta
 		delete(m, "persistent_state")
 	}
 
-	for k, v := range changes {
+	// build proofs and apply changes deterministically using sorted keys of 'changes'
+	changeKeys := sortedKeysFromMap(changes)
+	for _, k := range changeKeys {
+		v := changes[k]
 		old := m[k]
 		proof, _ := generateInclusionProof(k, m)
 		res.Proofs = append(res.Proofs, Proof{
@@ -674,7 +705,10 @@ func executeBatchWithDependencies(db *StateDB, b Batch, sm StateMachine, prevSta
 			NewValue:    v,
 			MerkleProof: proof,
 		})
+		// apply change
 		m[k] = v
+		// record change deterministically in res.Changes map (map iteration still nondet, but we only use map for storage)
+		res.Changes[k] = v
 	}
 
 	root, _, _ := computeStateRootFromMap(m)
@@ -682,7 +716,6 @@ func executeBatchWithDependencies(db *StateDB, b Batch, sm StateMachine, prevSta
 	res.ExecutionSummary.TxCount = txCount
 	res.ExecutionSummary.SuccessCount = successCount
 	res.ExecutionSummary.GasUsed = gasUsed
-	res.Changes = changes
 
 	return res, nil
 }
@@ -700,6 +733,7 @@ type KVResult struct {
 var stagingPool = sync.Pool{
 	New: func() any { return make(map[string][]byte, 128) },
 }
+
 // Single threaded execution
 func workerExecute(batch Batch) []KVResult {
 	staging := stagingPool.Get().(map[string][]byte)
@@ -735,65 +769,63 @@ func workerExecute(batch Batch) []KVResult {
 	return results
 }
 
-
 // Multithreaded execution
 func intraNodeExecute(batch Batch) []KVResult {
-    numCores := runtime.NumCPU()
-    chunkSize := (len(batch.TxHashes) + numCores - 1) / numCores
-    resultsChan := make(chan []KVResult, numCores)
-    var wg sync.WaitGroup
+	numCores := runtime.NumCPU()
+	chunkSize := (len(batch.TxHashes) + numCores - 1) / numCores
+	resultsChan := make(chan []KVResult, numCores)
+	var wg sync.WaitGroup
 
-    for c := 0; c < numCores; c++ {
-        start := c * chunkSize
-        end := min((c+1)*chunkSize, len(batch.TxHashes))
-        if start >= end {
-            break
-        }
+	for c := 0; c < numCores; c++ {
+		start := c * chunkSize
+		end := min((c+1)*chunkSize, len(batch.TxHashes))
+		if start >= end {
+			break
+		}
 
-        wg.Add(1)
-        go func(start, end int) {
-            defer wg.Done()
-            subBatch := Batch{
-                BatchID: batch.BatchID,
-                BlockHeight: batch.BlockHeight,
-                Sequence: batch.Sequence,
-                TxHashes: batch.TxHashes[start:end],
-                TxIndices: batch.TxIndices[start:end],
-                WorkerID: batch.WorkerID,
-            }
-            staging := make(map[string][]byte)
-            sm := NewStagingStateMachine(staging)
-            out, _ := executeBatchStaged(subBatch, sm)
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			subBatch := Batch{
+				BatchID:     batch.BatchID,
+				BlockHeight: batch.BlockHeight,
+				Sequence:    batch.Sequence,
+				TxHashes:    batch.TxHashes[start:end],
+				TxIndices:   batch.TxIndices[start:end],
+				WorkerID:    batch.WorkerID,
+			}
+			staging := make(map[string][]byte)
+			sm := NewStagingStateMachine(staging)
+			out, _ := executeBatchStaged(subBatch, sm)
 
-            localResults := []KVResult{}
-            for _, idx := range subBatch.TxIndices {
-                key := fmt.Sprintf("tx_%d", idx)
-                if v, ok := out[key]; ok {
-                    localResults = append(localResults, KVResult{
-                        Index: idx, Key: key, Value: v,
-                    })
-                }
-            }
-            resultsChan <- localResults
-        }(start, end)
-    }
+			localResults := []KVResult{}
+			for _, idx := range subBatch.TxIndices {
+				key := fmt.Sprintf("tx_%d", idx)
+				if v, ok := out[key]; ok {
+					localResults = append(localResults, KVResult{
+						Index: idx, Key: key, Value: v,
+					})
+				}
+			}
+			resultsChan <- localResults
+		}(start, end)
+	}
 
-    wg.Wait()
-    close(resultsChan)
+	wg.Wait()
+	close(resultsChan)
 
-    // Merge all local results
-    var allResults []KVResult
-    for res := range resultsChan {
-        allResults = append(allResults, res...)
-    }
+	// Merge all local results
+	var allResults []KVResult
+	for res := range resultsChan {
+		allResults = append(allResults, res...)
+	}
 
-    // Sort deterministically by IndexInBlock
-    sort.Slice(allResults, func(i, j int) bool {
-        return allResults[i].Index < allResults[j].Index
-    })
-    return allResults
+	// Sort deterministically by IndexInBlock
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].Index < allResults[j].Index
+	})
+	return allResults
 }
-
 
 func mergeResultsOrdered(workerResults [][]KVResult) []KVResult {
 	total := 0
@@ -811,6 +843,11 @@ func mergeResultsOrdered(workerResults [][]KVResult) []KVResult {
 }
 
 func applyResultsOrdered(db *StateDB, results []KVResult) error {
+	// Ensure deterministic key order (lexicographic)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Key < results[j].Key
+	})
+
 	b := db.NewBatch()
 	for _, kv := range results {
 		b.Put([]byte(kv.Key), kv.Value)
@@ -830,6 +867,13 @@ func sha256Hex(b []byte) string {
 func computeTxID(txData []byte) []byte {
 	h := sha256.Sum256(txData)
 	return h[:]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ---------------------------
@@ -894,7 +938,7 @@ func main() {
 		wg.Add(1)
 		go func(idx int, batch Batch) {
 			defer wg.Done()
-			workerResults[idx] = workerExecute(batch) // check out intranodeExecute for multithreaded execution (replace)
+			workerResults[idx] = workerExecute(batch) // check out intraNodeExecute for multithreaded execution (replace)
 		}(i, b)
 	}
 	wg.Wait()
