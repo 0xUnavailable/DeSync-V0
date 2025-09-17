@@ -1,4 +1,4 @@
-package main
+package desync
 
 import (
 	"encoding/hex"

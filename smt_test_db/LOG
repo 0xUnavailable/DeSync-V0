@@ -1,0 +1,8 @@
+=============== Sep 17, 2025 (WAT) ===============
+11:49:42.571334 log@legend F·NumFile S·FileSize N·Entry C·BadEntry B·BadBlock Ke·KeyError D·DroppedEntry L·Level Q·SeqNum T·TimeElapsed
+11:49:42.577417 db@open opening
+11:49:42.581276 version@stat F·[] S·0B[] Sc·[]
+11:49:42.582853 db@janitor F·2 G·0
+11:49:42.583078 db@open done T·5.558263ms
+11:49:42.585487 db@close closing
+11:49:42.585828 db@close done T·337.901µs

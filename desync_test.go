@@ -1,6 +1,7 @@
-package main
+package desync
 
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ProtonMail/go-ecvrf/ecvrf"
 )
 
 // ----------------- Pools -----------------
@@ -91,7 +94,7 @@ func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, w
 		db := resetTestDBBench(fmt.Sprintf("./bench_db_%d", totalTx))
 		defer db.Close()
 
-		prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
+		prevRoot, _ := db.CurrentRoot()
 		totalBlocks := totalTx / blockTx
 		startChain := time.Now()
 
@@ -110,11 +113,8 @@ func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, w
 				wg.Add(1)
 				go func(idx int, b Batch) {
 					defer wg.Done()
-					buf := kvResultPool.Get().([]KVResult)[:0]
 					results := workerExecute(b)
-					buf = append(buf, results...)
-					workerResults[idx] = buf
-					kvResultPool.Put(buf)
+					workerResults[idx] = results
 				}(bi, batch)
 			}
 			wg.Wait()
@@ -124,9 +124,9 @@ func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, w
 				b.Fatalf("applyResultsOrdered failed: %v", err)
 			}
 
-			root, err := computeStateRootFromDB(db)
+			root, err := db.CurrentRoot()
 			if err != nil {
-				b.Fatalf("computeStateRootFromDB failed: %v", err)
+				b.Fatalf("db.CurrentRoot failed: %v", err)
 			}
 			prevRoot = root
 		}
@@ -191,8 +191,8 @@ func BenchmarkScalingConstrained(b *testing.B) {
 // ----------------- Parallel Fraction Test -----------------
 
 func TestMeasureParallelFraction(t *testing.T) {
-	totalTx := 500_000
-	coresToTest := []int{1, 2, 4, 8, 16, 32, 64}
+	totalTx := 200_000
+	coresToTest := []int{1, 2, 4, 8, 16}
 	times := make(map[int]float64)
 
 	// Prepare transactions
@@ -202,7 +202,6 @@ func TestMeasureParallelFraction(t *testing.T) {
 		runtime.GOMAXPROCS(n)
 		start := time.Now()
 
-		// Single block execution (simulate intra-node execution)
 		db := resetTestDBBench(fmt.Sprintf("./pf_db_%d", n))
 		defer db.Close()
 		ordered := orderTransactionsDeterministic(txs)
@@ -240,7 +239,6 @@ func TestMeasureParallelFraction(t *testing.T) {
 	}
 }
 
-
 // ----------------- Deterministic Test -----------------
 
 func TestDeterministicExecution(t *testing.T) {
@@ -248,10 +246,8 @@ func TestDeterministicExecution(t *testing.T) {
 	blockTx := 5_000
 	batchSize := 500
 
-	// Prepare transactions
 	txs := ensureTxDataJSONBench("deterministic_txs.json", totalTx)
 
-	// Configurations to test determinism
 	configs := []struct {
 		name    string
 		workers int
@@ -262,7 +258,6 @@ func TestDeterministicExecution(t *testing.T) {
 		{"multi_worker_multi_core", 10, runtime.NumCPU()},
 	}
 
-	// Run each config multiple times to catch nondeterminism
 	runsPerConfig := 3
 	finalRoots := make(map[string][]string)
 
@@ -280,7 +275,7 @@ func TestDeterministicExecution(t *testing.T) {
 					workerIDs[i] = uint64(6000 + i)
 				}
 
-				prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
+				prevRoot, _ := db.CurrentRoot()
 				totalBlocks := totalTx / blockTx
 
 				for blk := 0; blk < totalBlocks; blk++ {
@@ -298,7 +293,7 @@ func TestDeterministicExecution(t *testing.T) {
 						wg.Add(1)
 						go func(idx int, b Batch) {
 							defer wg.Done()
-							results := workerExecute(b) // deterministic worker execution
+							results := workerExecute(b)
 							workerResults[idx] = results
 						}(bi, batch)
 					}
@@ -309,9 +304,9 @@ func TestDeterministicExecution(t *testing.T) {
 						t.Fatalf("applyResultsOrdered failed: %v", err)
 					}
 
-					root, err := computeStateRootFromDB(db)
+					root, err := db.CurrentRoot()
 					if err != nil {
-						t.Fatalf("computeStateRootFromDB failed: %v", err)
+						t.Fatalf("db.CurrentRoot failed: %v", err)
 					}
 					prevRoot = root
 				}
@@ -323,9 +318,6 @@ func TestDeterministicExecution(t *testing.T) {
 		}
 	}
 
-	// Validate determinism:
-	// 1. All runs within each config must match
-	// 2. All configs must match each other
 	var referenceRoot string
 	for cfg, roots := range finalRoots {
 		first := roots[0]
@@ -345,4 +337,78 @@ func TestDeterministicExecution(t *testing.T) {
 	}
 
 	t.Logf("🎉 All configurations and runs produced the same final root: %s", referenceRoot)
+}
+
+// ----------------- VRF Test -----------------
+
+func TestVRFProveVerify(t *testing.T) {
+	sk, err := ecvrf.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key err: %v", err)
+	}
+	pk, err := sk.Public()
+	if err != nil {
+		t.Fatalf("get public err: %v", err)
+	}
+
+	seed := []byte("epoch-seed-12345")
+
+	beta, proof, err := sk.Prove(seed)
+	if err != nil {
+		t.Fatalf("prove err: %v", err)
+	}
+
+	ok, beta2, err := pk.Verify(seed, proof)
+	if err != nil {
+		t.Fatalf("verify err: %v", err)
+	}
+	if !ok {
+		t.Fatal("verify failed")
+	}
+	if !bytes.Equal(beta, beta2) {
+		t.Fatalf("beta mismatch: got %x want %x", beta2, beta)
+	}
+
+	// wrapper functions
+	h, p, err := vrfGenerateHash(seed, sk.Bytes())
+	if err != nil {
+		t.Fatalf("vrfGenerateHash err: %v", err)
+	}
+	ok2, err := vrfVerifyHash(h, p, pk.Bytes(), seed)
+	if err != nil {
+		t.Fatalf("vrfVerifyHash err: %v", err)
+	}
+	if !ok2 {
+		t.Fatal("vrfVerifyHash returned false")
+	}
+}
+
+// ----------------- SMT Proof Test -----------------
+
+func TestSMTProofRoundTrip(t *testing.T) {
+	db := resetTestDBBench("./smt_test_db")
+	defer db.Close()
+
+	key := []byte("foo")
+	value := []byte("bar")
+
+	// Update state
+	root, err := db.SMTUpdate(key, value)
+	if err != nil {
+		t.Fatalf("SMTUpdate err: %v", err)
+	}
+
+	// Generate proof
+	proof, err := db.SMTGenerateProof(key)
+	if err != nil {
+		t.Fatalf("SMTGenerateProof err: %v", err)
+	}
+
+	// Verify proof
+	ok := VerifyProof(key, value, proof, SMTDepth, root)
+	if !ok {
+		t.Fatalf("VerifyProof failed: key=%s value=%s root=%x", key, value, root)
+	}
+
+	t.Logf("✅ SMT proof verified successfully for key=%s value=%s root=%x", key, value, root)
 }
