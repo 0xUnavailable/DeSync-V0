@@ -7,7 +7,7 @@ Unlike traditional blockchain systems where ordering and execution are tightly c
 ---
 
 ## ✅ Current Progress
-👉 See [PROGRESS.md](PROGRESS.md) for the full list of available commands.
+👉 See [PROGRESS.md](PROGRESS.md).
 
 
 
