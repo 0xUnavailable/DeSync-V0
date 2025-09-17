@@ -1,51 +1,119 @@
 # DESYNC Protocol
 
-DESYNC is a next-generation execution-layer protocol designed for **deterministic transaction ordering, parallelized batch execution, and verifiable state transitions**.  
+DESYNC is a **next-generation execution-layer protocol** designed for **deterministic transaction ordering, parallelized batch execution, and verifiable state transitions**.  
 
-Unlike traditional blockchain systems where ordering and execution are tightly coupled (causing bottlenecks), DESYNC **separates ordering from execution**, allowing multiple workers to process batches of transactions deterministically while preserving a globally consistent state root.
+Unlike traditional blockchain systems where ordering and execution are tightly coupled (causing bottlenecks), DESYNC **separates ordering from execution**, allowing multiple workers and CPU cores to process transactions in parallel while preserving a globally consistent state root.
+
+---
+
+## ✅ Current Progress
+👉 See [PROGRESS.md](PROGRESS.md).
+
+
+
+---
+
+## 📊 Scaling Comparison
+Worker batches are subdivided across CPU cores. 
+We benchmarked DESYNC under two scenarios:
+
+- **Unconstrained** → Max parallel execution (all workers active). 
+- **Constrained** → Simulated blockchain limits (restricted worker pool, memory pressure). 
+Constrained vs Unconstrained Execution
+
+Unconstrained
+
+All workers run in parallel.
+
+Batches are executed concurrently and merged into a single commit per block.
+
+Represents an ideal, high-performance environment.
+
+Constrained
+
+Worker count fluctuates per block to simulate real-world resource degradation and recovery (e.g., 10 → 5 → 2 → 5 → 7).
+
+Batches are executed sequentially, with an immediate commit per batch.
+
+Represents environments with limited or unstable resources (disk IO bottlenecks, CPU throttling, etc.).
+
+👉 This way, constrained execution isn’t just “slower” — it actually models degraded conditions, which is more realistic for production-like stress testing.
+
+[scaling_comparison_uc.png](scaling_comparison_uc.png)
+
+
+
+---
+
+## 📈 Insights from Scaling
+
+### Amdahl’s Law
+
+The theoretical speedup of parallel execution is:
+
+$$
+S(N) = \frac{1}{(1-p) + \frac{p}{N}}
+$$
+
+* `p` = fraction of workload parallelizable
+* `N` = number of cores
+* `S(N)` = speedup vs single-core
+
+| p (parallel fraction) | Cores | Speedup | TPS (base 10k) |
+| --------------------- | ----- | ------- | -------------- |
+| 0.5                   | 16    | 1.88    | 18,823         |
+| 0.7                   | 16    | 2.90    | 29,090         |
+| 0.9                   | 16    | 6.40    | 64,000         |
+
+🔹 With **p=0.5 (50% parallel)** → diminishing returns after \~4 cores.
+🔹 With **p=0.9 (90% parallel)** → scaling is nearly linear.
+
+**Observation:** Intra-node execution achieves higher TPS than worker-only execution. Gains flatten beyond 20 workers/cores, where sequential bottlenecks (DB writes, state merges) dominate.
+
+---
+
+## ⚡ Features
+
+* **Staged execution** → workers/core-local execution before committing.
+* **Deterministic merge** → results combined in strict order, ensuring consensus safety.
+* **Batched DB writes** → drastically reduces I/O overhead.
+* **Sync pools** → pooled slices/maps minimize allocations.
+* **Benchmark suite** → TPS, allocations, and throughput measured under different loads.
+* **Proof system** → inclusion proofs from Merkle roots for verifiable state.
 
 ---
 
 ## Why DESYNC?
 
-Blockchains today face a tradeoff:
-- **Throughput vs. Security**: Higher parallelism often leads to non-determinism or execution conflicts.  
-- **Ordering Fairness**: MEV and frontrunning distort fair ordering.  
-- **Scalability**: Monolithic execution bottlenecks performance.  
+Current blockchains suffer from:
 
-DESYNC solves this by:
-- Using **deterministic transaction ordering** (based on block height + index).  
-- **Splitting execution into batches** processed by multiple worker nodes.  
-- **Verifiable receipts and proofs** (Merkle + VRF) to confirm correctness.  
-- **Leader election with VRF** to avoid bias and manipulation.  
+* **Throughput bottlenecks** → sequential execution dominates.
+* **Fairness issues** → frontrunning & MEV distort ordering.
+* **Poor scalability** → monolithic execution blocks parallelism.
 
----
+DESYNC addresses these with:
 
-## Architecture Overview
+* Deterministic ordering independent of execution.
+* Batch-parallel execution across workers and CPU cores.
+* Verifiable receipts & Merkle proofs for correctness.
+* VRF-based leader election (low-bias).
 
-### High-Level Flow
+## 🏗️ Architecture Overview
+
+### Execution Flow
 
 ```mermaid
 flowchart TD
-    A[Transactions from Users] --> B[Deterministic Ordering]
+    A[Transactions] --> B[Deterministic Ordering]
     B --> C[Batch Creation]
-    C --> D[Assigned to Workers]
-    D --> E[Execution with State Machine]
-    E --> F[BatchResult + Proofs]
-    F --> G[Receipt Verification]
-    G --> H[New State Root]
-````
+    C --> D[Assign Workers]
+    D --> E[Intra-node CPU Cores]
+    E --> F[State Updates + Proofs]
+    F --> G[Merging & Conflict Resolution]
+    G --> H[Commit State Root]
+```
 
-* **Ordering**: Transactions are sorted by `(BlockHeight, IndexInBlock, TxID)`.
-* **Batching**: Ordered txs are split into fixed-size batches.
-* **Workers**: Each batch is assigned to a worker node.
-* **Execution**: Workers apply transactions deterministically.
-* **Proofs**: Workers generate inclusion proofs & receipts.
-* **Verification**: Other nodes verify receipts against state roots.
-
----
-
-### Node Election (VRF)
+### Leader Election (VRF)
 
 ```mermaid
 sequenceDiagram
@@ -62,51 +130,39 @@ sequenceDiagram
     Node2->>Coordinator: Beta2, Proof2
     Node3->>Coordinator: Beta3, Proof3
 
-    Coordinator->>Coordinator: Verify all proofs
-    Coordinator->>Coordinator: Select lowest Beta = Leader
-```
-
-* Each node runs **VRF Prove(seed)**.
-* All outputs are verified publicly.
-* The node with the **lowest VRF output** is elected leader.
-
----
-
-## Key Components
-
-* **Transactions** → Basic structure with `TxID`, `Nonce`, `GasPrice`, etc.
-* **Batches** → Deterministically grouped sets of txs.
-* **Execution State** → Maintained as key/value store with Merkle proofs.
-* **Receipts** → Contain `PostStateRoot` + signatures for verification.
-* **Evidence** → Mechanism for slashing misbehaving nodes.
-* **Persistence** → Backed by LevelDB for durability.
-
----
-
-## Example Output
-
-```bash
-DESYNC prototype (updated). Demo run...
-restored epoch: 1
-Created 3 batches
-Batch 1 -> post_root 7e1b4c...
-Receipt verified for batch 1
-Batch 2 -> post_root 9a3d12...
-Receipt verified for batch 2
-Batch 3 -> post_root 6b42f8...
-Receipt verified for batch 3
+    Coordinator->>Coordinator: Verify proofs
+    Coordinator->>Coordinator: Lowest Beta → Leader
 ```
 
 ---
 
-##  Roadmap
+## 📂 Repository Structure
 
-* [x] Deterministic transaction ordering
-* [x] Merkle state root computation
-* [x] VRF-based leader election (EC-VRF)
-* [x] LevelDB persistence
-* [ ] ABCI interface (`CheckTx`, `DeliverTx`, `Commit`)
-* [ ] Tendermint integration
-* [ ] Evidence + slashing rules
-* [ ] Networking (libp2p/gRPC)
-* [ ] Stress testing at 10k+ TPS
+```
+.
+├── types.go                           # Core types (Transaction, Batch, Receipt, etc.)
+├── statedb_smt.go                     # LevelDB-backed state database with SMT implementation
+├── smt.go                             # Sparse Merkle Tree + proofs
+├── execution.go                       # State machine + batch execution
+├── workers.go                         # Worker + intra-node execution
+├── utils.go                           # Helpers (hashing, sorting, etc.)
+├── main.go                            # Demo runner
+├── desync_test.go                     # Deterministic + scaling benchmarks
+├── scaling_unconstrained.csv          # Benchmark data under "unconstrained" state
+├── scaling_constrained.csv            # Benchmark data under constrained state
+├── plot_scaling_comparison.py         # Benchmark visualization
+├── README.md                          # Main documentation
+├── MAKE_COMMANDS.md                   # Makefile workflow
+└── PROGRESS.md                        # This file
+```
+
+---
+
+## 🛠️ Makefile Commands
+
+We use a `Makefile` to simplify running tests, benchmarks, and cleaning up.  
+
+👉 See [MAKE_COMMANDS.md](MAKE_COMMANDS.md) for the full list of available commands.
+
+
+

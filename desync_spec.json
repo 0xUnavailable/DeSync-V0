@@ -1,0 +1,195 @@
+{
+  "desync_specification": {
+    "version": "3.1",
+    "overview": {
+      "description": "DESYNC is an execution protocol that extends Tendermint by introducing a leader worker execution model with VRF-based leader election, parallel batch execution, and verifiable receipts. It ensures deterministic state transitions, supports fraud proofs, and enforces slashing for invalid behavior."
+    },
+    "constants": {
+      "epoch_duration": "180s",
+      "commit_period": "30s",
+      "reveal_period": "30s",
+      "max_batch_size": 1000,
+      "worker_execution_timeout": "30s",
+      "heartbeat_interval": "100ms"
+    },
+    "node_types": {
+      "client": {
+        "role": "Submit signed transactions via Tendermint RPC.",
+        "messages": [
+          "Transaction"
+        ]
+      },
+      "validator": {
+        "role": "Run Tendermint consensus + Desync ABCI app. Participate in VRF commit/reveal, verify receipts, finalize state root.",
+        "messages": [
+          "vrf_commit",
+          "vrf_reveal",
+          "Evidence",
+          "Transaction"
+        ]
+      },
+      "desync_abci": {
+        "role": "Batch creation, assignment to workers, receipt verification, commit of final AppHash to Tendermint.",
+        "functions": [
+          "CheckTx",
+          "DeliverTx",
+          "BeginBlock",
+          "EndBlock",
+          "Commit"
+        ]
+      },
+      "worker": {
+        "role": "Execute batches deterministically, produce receipts + proofs, sign results.",
+        "messages": [
+          "BatchAssignment",
+          "BatchResult",
+          "Receipt"
+        ]
+      },
+      "monitor": {
+        "role": "Verify receipts off-chain and submit fraud evidence if inconsistencies are found.",
+        "messages": [
+          "Evidence"
+        ]
+      }
+    },
+    "data_structures": {
+      "Transaction": {
+        "tx_id": "bytes",
+        "tx_data": "bytes",
+        "signature": "bytes",
+        "pubkey": "bytes",
+        "nonce": "uint64",
+        "gas_price": "uint64"
+      },
+      "Batch": {
+        "batch_id": "uint64",
+        "block_height": "uint64",
+        "sequence": "uint64",
+        "tx_hashes": [
+          "bytes"
+        ],
+        "prev_state_root": "bytes",
+        "worker_id": "uint64"
+      },
+      "BatchResult": {
+        "batch_id": "uint64",
+        "worker_id": "uint64",
+        "post_state_root": "bytes",
+        "proofs": [
+          {
+            "key": "bytes",
+            "old_value": "bytes",
+            "new_value": "bytes",
+            "merkle_proof": "bytes"
+          }
+        ],
+        "execution_summary": {
+          "tx_count": "uint32",
+          "success_count": "uint32",
+          "gas_used": "uint64"
+        },
+        "signature": "bytes"
+      },
+      "Receipt": {
+        "batch_id": "uint64",
+        "worker_id": "uint64",
+        "post_state_root": "bytes",
+        "signature": "bytes"
+      },
+      "Evidence": {
+        "reporter_id": "uint64",
+        "offending_receipt": "Receipt",
+        "counter_proof": {
+          "key": "bytes",
+          "correct_value": "bytes",
+          "merkle_proof": "bytes"
+        },
+        "timestamp_unix_ms": "int64",
+        "signature": "bytes"
+      },
+      "VRFCommit": {
+        "sender_id": "uint64",
+        "epoch": "uint64",
+        "hash_commit": "bytes",
+        "signature": "bytes"
+      },
+      "VRFReveal": {
+        "sender_id": "uint64",
+        "epoch": "uint64",
+        "revealed_hash": "uint64",
+        "vrf_proof": "bytes"
+      }
+    },
+    "core_functions": {
+      "vrf_generate": "vrfGenerate(seed, private_key) -> (hash, proof)",
+      "vrf_verify": "vrfVerify(hash, proof, public_key, seed) -> bool",
+      "compute_state_root": "computeStateRoot(state_changes) -> bytes",
+      "verify_receipt": "verifyReceipt(receipt, proofs) -> bool",
+      "submit_evidence": "submitEvidence(evidence) -> bool"
+    },
+    "protocol_flow": {
+      "election": [
+        "Validators compute hash_commit and broadcast VRFCommit",
+        "Validators broadcast VRFReveal with revealed_hash + proof",
+        "All validators verify proofs and compute weighted_hash = revealed_hash / stake",
+        "Lowest weighted_hash = leader, second = backup_leader"
+      ],
+      "tx_submission": [
+        "Client signs and broadcasts Transaction to Tendermint RPC",
+        "Tendermint proposer includes txs in block",
+        "ABCI DeliverTx buffers txs in deterministic block order"
+      ],
+      "batch_execution": [
+        "Leader creates batches from blockTxList deterministically",
+        "Leader sends BatchAssignment to workers",
+        "Workers execute batches deterministically, compute post_state_root, produce proofs",
+        "Workers return BatchResult + Receipt"
+      ],
+      "verification_and_commit": [
+        "Leader verifies BatchResults using proofs",
+        "Leader applies state roots sequentially to derive FinalStateRoot",
+        "Leader commits FinalStateRoot as AppHash in ABCI Commit()",
+        "Tendermint finalizes block"
+      ],
+      "fraud_proof": [
+        "Any validator/monitor re-verifies BatchResults",
+        "If mismatch found, Evidence is submitted as DeliverTx",
+        "ABCI verifies counter_proof, slashes worker, and reassigns batch or re-executes"
+      ]
+    },
+    "rules": {
+      "determinism": "All workers must produce identical results given same inputs",
+      "slashing": "Workers producing invalid receipts lose stake",
+      "fraud_proofs": "Validators can challenge receipts with Evidence",
+      "timeouts": {
+        "leader_timeout": "If no heartbeat > heartbeat_interval * threshold, backup takes over",
+        "worker_timeout": "If no BatchResult by worker_execution_timeout, reassign batch"
+      }
+    },
+    "security": {
+      "byzantine_fault_tolerance": "Safe if < 1/3 workers or validators are Byzantine",
+      "proof_integrity": "SMT proofs guarantee state update correctness",
+      "liveness": "Leader rotation and Tendermint consensus ensure progress"
+    },
+    "implementation_priority": {
+      "P0": [
+        "VRF commit/reveal election",
+        "Deterministic batching (block.Tx order)",
+        "Worker execution + SMT proofs",
+        "Receipt verification in ABCI",
+        "Commit AppHash"
+      ],
+      "P1": [
+        "Slashing and staking registry",
+        "Fraud proof challenge flow",
+        "Worker registration and authentication"
+      ],
+      "P2": [
+        "Operator tooling + SDKs",
+        "Performance optimization",
+        "Cross-rollup bundling"
+      ]
+    }
+  }
+}

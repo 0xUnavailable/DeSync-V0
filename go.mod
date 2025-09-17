@@ -1,9 +1,13 @@
-module goraft
+module github.com/MelzLabs/DeSync
 
-go 1.19
+go 1.24.4
 
-replace github.com/eatonphil/goraft => ../.. //
+require (
+	github.com/ProtonMail/go-ecvrf v0.0.1
+	github.com/syndtr/goleveldb v1.0.0
+)
 
-require github.com/sasha-s/go-deadlock v0.3.1
-
-require github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5 // indirect
+require (
+	filippo.io/edwards25519 v1.0.0 // indirect
+	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
+)
