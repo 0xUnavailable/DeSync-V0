@@ -40,6 +40,12 @@ ax.errorbar(x - width/2, df["u_mean"], yerr=df["u_std"], fmt='none',
 ax.errorbar(x + width/2, df["c_mean"], yerr=df["c_std"], fmt='none',
             ecolor='gray', elinewidth=1, alpha=0.5, capsize=3, zorder=1)
 
+# Max recorded value horizontal lines
+max_u = u["TPS"].max()
+max_c = c["TPS"].max()
+ax.axhline(y=max_u, color='steelblue', linestyle='--', alpha=0.7, linewidth=2, label=f'Unconstrained Max: {max_u:.0f} TPS')
+ax.axhline(y=max_c, color='darkorange', linestyle='--', alpha=0.7, linewidth=2, label=f'Constrained Max: {max_c:.0f} TPS')
+
 # Labels
 ax.set_xticks(x)
 ax.set_xticklabels([f"{int(v):,}" for v in df["totalTx"]])
@@ -69,3 +75,7 @@ plt.show()
 # Print aggregated table
 print("\nAggregated results:")
 print(df[["totalTx", "u_mean", "u_std", "c_mean", "c_std"]])
+
+# Print max recorded values
+print(f"\nMax Unconstrained TPS: {max_u:.2f}")
+print(f"Max Constrained TPS: {max_c:.2f}")

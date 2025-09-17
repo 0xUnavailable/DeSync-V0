@@ -6,69 +6,42 @@ Unlike traditional blockchain systems where ordering and execution are tightly c
 
 ---
 
-## ✅ Current Progress (from TODO roadmap)
+## ✅ Current Progress
+👉 See [PROGRESS.md](PROGRESS.md) for the full list of available commands.
 
-We started from a basic prototype and incrementally implemented key features:
 
-- [x] **Modularized codebase**  
-   - Core logic split into files (`types.go`, `statedb.go`, `merkle.go`, `execution.go`, etc.).  
-   - Easier maintainability and testing.  
-
-- [x] **Deterministic transaction ordering**  
-   - Transactions sorted by `(BlockHeight, IndexInBlock, TxID)`.  
-   - Ensures identical commit order across all nodes.  
-
-- [x] **Deterministic merge ordering**  
-   - All worker results merged by sorted keys before commit.  
-   - Prevents nondeterminism from Go map iteration order.  
-
-- [x] **Parallel batch execution with sync.Pool optimizations**  
-   - Workers execute batches independently, results merged deterministically.  
-   - Reduced allocation overhead via `sync.Pool`.  
-
-- [x] **Intra-node parallel execution**  
-   - Batches subdivided across CPU cores.  
-   - Deterministic sorting ensures identical results across runs.  
-
-- [x] **Merkle state root computation**  
-   - Each block commits a deterministic Merkle root.  
-   - Enables inclusion proofs and verifiable receipts.  
-
-- [x] **Execution pipeline testing + benchmarking**  
-   - Integrated Go benchmarks measuring TPS, allocations, memory usage.  
-   - Deterministic test ensures all nodes/cores produce the same state root.  
-
-- [x] **Scaling experiments**  
-   - Achieved **~1.4M TPS** (1M transactions in <700ms) in local benchmarks.  
 
 ---
 
 ## 📊 Scaling Comparison
+Worker batches are subdivided across CPU cores. 
+We benchmarked DESYNC under two scenarios:
 
-We benchmarked DESYNC under three scenarios:
+- **Unconstrained** → Max parallel execution (all workers active). 
+- **Constrained** → Simulated blockchain limits (restricted worker pool, memory pressure). 
+Constrained vs Unconstrained Execution
 
-- **Unconstrained** → Max parallel execution (all workers active).  
-- **Constrained** → Simulated blockchain limits (restricted worker pool, memory pressure).  
-- **Intra-node** → Worker batches subdivided across CPU cores.  
+Unconstrained
 
-### Run benchmarks:
+All workers run in parallel.
 
-```bash
-# Unconstrained
-go test -bench=BenchmarkScalingUnconstrained -benchmem -run=^$ -v
+Batches are executed concurrently and merged into a single commit per block.
 
-# Constrained
-go test -bench=BenchmarkScalingConstrained -benchmem -run=^$ -v
+Represents an ideal, high-performance environment.
 
-# Intra-node execution
-go test -bench=BenchmarkScalingIntra -benchmem -run=^$ -v
-````
+Constrained
 
-### Generate comparison chart:
+Worker count fluctuates per block to simulate real-world resource degradation and recovery (e.g., 10 → 5 → 2 → 5 → 7).
 
-```bash
-python3 plot_scaling_comparison.py
-```
+Batches are executed sequentially, with an immediate commit per batch.
+
+Represents environments with limited or unstable resources (disk IO bottlenecks, CPU throttling, etc.).
+
+👉 This way, constrained execution isn’t just “slower” — it actually models degraded conditions, which is more realistic for production-like stress testing.
+
+[scaling_comparison_uc.png](scaling_comparison_uc.png)
+
+
 
 ---
 
@@ -125,38 +98,6 @@ DESYNC addresses these with:
 * Verifiable receipts & Merkle proofs for correctness.
 * VRF-based leader election (low-bias).
 
----
-
-## Benchmarks
-
-Run with memory stats:
-
-```bash
-go test -bench=. -benchmem -run=^$ -v
-```
-
-Run **deterministic test**:
-
-```bash
-go test -v -run TestDeterministicExecution
-```
-
-Run **full execution pipeline test**:
-
-```bash
-go test -v -run TestFullExecutionPipeline -bench=. -benchmem
-```
-
-Example:
-
-```
-=== RUN   TestDeterministicExecution
-    🎉 All configurations and runs produced the same final root: 2c3697500a11c903...
---- PASS: TestDeterministicExecution (2.1s)
-```
-
----
-
 ## 🏗️ Architecture Overview
 
 ### Execution Flow
@@ -199,35 +140,29 @@ sequenceDiagram
 
 ```
 .
-├── types.go                  # Core types (Transaction, Batch, Receipt, etc.)
-├── statedb.go                # LevelDB-backed state database
-├── merkle.go                 # Merkle tree + proofs
-├── execution.go              # State machine + batch execution
-├── workers.go                # Worker + intra-node execution
-├── utils.go                  # Helpers (hashing, sorting, etc.)
-├── main.go                   # Demo runner
-├── desync_test.go            # Deterministic + scaling benchmarks
-├── scaling_unconstrained.csv
-├── scaling_constrained.csv
-├── scaling_intra.csv
-├── plot_scaling_comparison.py # Benchmark visualization
-├── README.md                 # This file
-└── PROGRESS.md               # Running implementation log
+├── types.go                           # Core types (Transaction, Batch, Receipt, etc.)
+├── statedb_smt.go                     # LevelDB-backed state database with SMT implementation
+├── smt.go                             # Sparse Merkle Tree + proofs
+├── execution.go                       # State machine + batch execution
+├── workers.go                         # Worker + intra-node execution
+├── utils.go                           # Helpers (hashing, sorting, etc.)
+├── main.go                            # Demo runner
+├── desync_test.go                     # Deterministic + scaling benchmarks
+├── scaling_unconstrained.csv          # Benchmark data under "unconstrained" state
+├── scaling_constrained.csv            # Benchmark data under constrained state
+├── plot_scaling_comparison.py         # Benchmark visualization
+├── README.md                          # Main documentation
+├── MAKE_COMMANDS.md                   # Makefile workflow
+└── PROGRESS.md                        # This file
 ```
 
 ---
 
-## Example Run
+## 🛠️ Makefile Commands
 
-```bash
-DESYNC prototype (intra-node update). Demo run...
-Created 3 batches
-Batch 1 → post_root 7e1b4c...
-Batch 2 → post_root 9a3d12...
-Batch 3 → post_root 6b42f8...
-Final root after merged commit: 2c3697500a11c903...
-```
+We use a `Makefile` to simplify running tests, benchmarks, and cleaning up.  
 
-```
+👉 See [MAKE_COMMANDS.md](MAKE_COMMANDS.md) for the full list of available commands.
+
 
 

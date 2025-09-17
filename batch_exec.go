@@ -116,14 +116,15 @@ func executeBatchWithDependencies(db *StateDB, b Batch, sm StateMachine, prevSta
 	changeKeys := sortedKeysFromMap(changes)
 	for _, k := range changeKeys {
 		v := changes[k]
-		old := m[k]
 		proof, _ := generateInclusionProof(k, m)
-		res.Proofs = append(res.Proofs, Proof{
+
+		res.Proofs = append(res.Proofs, KeyValueProof{
 			Key:         []byte(k),
-			OldValue:    old,
-			NewValue:    v,
+			Value:       v,
 			MerkleProof: proof,
+			Root:        nil, // optional: can set to current root if needed
 		})
+
 		m[k] = v
 		res.Changes[k] = v
 	}

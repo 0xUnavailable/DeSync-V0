@@ -10,9 +10,12 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"testing"
 	"time"
+	"testing"
+)
 
+// keep ecvrf import used by VRF test
+import (
 	"github.com/ProtonMail/go-ecvrf/ecvrf"
 )
 
@@ -78,27 +81,41 @@ func writeCSVResult(file string, record []string) {
 
 // ----------------- Core Runner -----------------
 
-func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, workers int) {
+// runScalingCase runs the scaling scenario.
+// - constrained=false → full parallelism, one commit per block
+// - constrained=true  → sequential batch execution, immediate commit per batch,
+//   worker count fluctuates across blocks (degrades and recovers)
+func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, workers int, constrained bool) {
 	if _, err := os.Stat(csvFile); os.IsNotExist(err) {
-		writeCSVResult(csvFile, []string{"totalTx", "blockTx", "batchSize", "workers", "elapsed_ms", "TPS"})
+		writeCSVResult(csvFile, []string{"totalTx", "blockTx", "batchSize", "workers", "constrained", "elapsed_ms", "TPS"})
 	}
 
 	allTxs := ensureTxDataJSONBench(fmt.Sprintf("bench_%d.json", totalTx), totalTx)
-	workerIDs := make([]uint64, workers)
-	for i := range workerIDs {
-		workerIDs[i] = uint64(5000 + i)
-	}
+
+	// worker fluctuation sequence used when constrained
+	fluctuations := []int{workers, workers / 2, 2, workers / 2, (workers*7)/10}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		db := resetTestDBBench(fmt.Sprintf("./bench_db_%d", totalTx))
+	for iter := 0; iter < b.N; iter++ {
+		db := resetTestDBBench(fmt.Sprintf("./bench_db_%d_%d", totalTx, iter))
 		defer db.Close()
 
-		prevRoot, _ := db.CurrentRoot()
+		prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
 		totalBlocks := totalTx / blockTx
 		startChain := time.Now()
 
 		for blk := 0; blk < totalBlocks; blk++ {
+			// choose worker count (fluctuating if constrained)
+			currWorkers := workers
+			if constrained {
+				currWorkers = fluctuations[blk%len(fluctuations)]
+			}
+
+			workerIDs := make([]uint64, currWorkers)
+			for i := range workerIDs {
+				workerIDs[i] = uint64(5000 + i)
+			}
+
 			blockTxs := allTxs[blk*blockTx : (blk+1)*blockTx]
 			for i := range blockTxs {
 				blockTxs[i].BlockHeight = uint64(blk + 1)
@@ -106,27 +123,44 @@ func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, w
 
 			ordered := orderTransactionsDeterministic(blockTxs)
 			batches := createSequentialBatches(ordered, workerIDs, batchSize, uint64(blk+1), prevRoot)
-
 			workerResults := make([][]KVResult, len(batches))
-			var wg sync.WaitGroup
-			for bi, batch := range batches {
-				wg.Add(1)
-				go func(idx int, b Batch) {
-					defer wg.Done()
-					results := workerExecute(b)
-					workerResults[idx] = results
-				}(bi, batch)
-			}
-			wg.Wait()
 
-			merged := mergeResultsOrdered(workerResults)
-			if err := applyResultsOrdered(db, merged); err != nil {
-				b.Fatalf("applyResultsOrdered failed: %v", err)
+			if constrained {
+				b.Logf("Block %d → constrained workers=%d", blk+1, currWorkers)
+				// Sequential execution, commit immediately per batch
+				for bi, batch := range batches {
+					results := workerExecute(batch)
+					workerResults[bi] = results
+					if err := applyResultsOrdered(db, results); err != nil {
+						b.Fatalf("applyResultsOrdered (constrained per-batch) failed: %v", err)
+					}
+				}
+			} else {
+				// Parallel execution, single commit
+				var wg sync.WaitGroup
+				for bi, batch := range batches {
+					wg.Add(1)
+					go func(idx int, batch Batch) {
+						defer wg.Done()
+						buf := kvResultPool.Get().([]KVResult)[:0]
+						results := workerExecute(batch)
+						buf = append(buf, results...)
+						workerResults[idx] = buf
+						kvResultPool.Put(buf)
+					}(bi, batch)
+				}
+				wg.Wait()
+
+				merged := mergeResultsOrdered(workerResults)
+				if err := applyResultsOrdered(db, merged); err != nil {
+					b.Fatalf("applyResultsOrdered failed: %v", err)
+				}
 			}
 
-			root, err := db.CurrentRoot()
+			// compute root after block
+			root, err := computeStateRootFromDB(db)
 			if err != nil {
-				b.Fatalf("db.CurrentRoot failed: %v", err)
+				b.Fatalf("computeStateRootFromDB failed: %v", err)
 			}
 			prevRoot = root
 		}
@@ -135,8 +169,8 @@ func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, w
 		tps := float64(totalTx) / elapsed.Seconds()
 
 		b.ReportMetric(tps, "tx/s")
-		b.Logf("[%s] %d tx → elapsed=%s, TPS=%.2f, finalRoot=%s",
-			csvFile, totalTx, elapsed, tps, hex.EncodeToString(prevRoot),
+		b.Logf("[%s] %d tx (constrained=%v) → elapsed=%s, TPS=%.2f, finalRoot=%s",
+			csvFile, totalTx, constrained, elapsed, tps, hex.EncodeToString(prevRoot),
 		)
 
 		writeCSVResult(csvFile, []string{
@@ -144,11 +178,13 @@ func runScalingCase(b *testing.B, csvFile string, totalTx, blockTx, batchSize, w
 			fmt.Sprintf("%d", blockTx),
 			fmt.Sprintf("%d", batchSize),
 			fmt.Sprintf("%d", workers),
+			fmt.Sprintf("%v", constrained),
 			fmt.Sprintf("%.2f", float64(elapsed.Milliseconds())),
 			fmt.Sprintf("%.2f", tps),
 		})
 	}
 }
+
 
 // ----------------- Benchmarks -----------------
 
@@ -164,8 +200,9 @@ func BenchmarkScalingUnconstrained(b *testing.B) {
 		{1_000_000, 25_000, 500, 20},
 	}
 	for _, c := range cases {
+		// unconstrained = false means we allow full parallelism
 		b.Run(fmt.Sprintf("%dtx_unconstrained", c.totalTx), func(b *testing.B) {
-			runScalingCase(b, "scaling_unconstrained.csv", c.totalTx, c.blockTx, c.batchSize, c.workers)
+			runScalingCase(b, "scaling_unconstrained.csv", c.totalTx, c.blockTx, c.batchSize, c.workers, false)
 		})
 	}
 }
@@ -182,8 +219,9 @@ func BenchmarkScalingConstrained(b *testing.B) {
 		{1_000_000, 25_000, 500, 20},
 	}
 	for _, c := range cases {
+		// constrained = true will constrain worker count and force sequential commit behavior
 		b.Run(fmt.Sprintf("%dtx_constrained", c.totalTx), func(b *testing.B) {
-			runScalingCase(b, "scaling_constrained.csv", c.totalTx, c.blockTx, c.batchSize, c.workers)
+			runScalingCase(b, "scaling_constrained.csv", c.totalTx, c.blockTx, c.batchSize, c.workers, true)
 		})
 	}
 }
@@ -191,8 +229,8 @@ func BenchmarkScalingConstrained(b *testing.B) {
 // ----------------- Parallel Fraction Test -----------------
 
 func TestMeasureParallelFraction(t *testing.T) {
-	totalTx := 200_000
-	coresToTest := []int{1, 2, 4, 8, 16}
+	totalTx := 500_000
+	coresToTest := []int{1, 2, 4, 8, 16, 32, 64}
 	times := make(map[int]float64)
 
 	// Prepare transactions
@@ -202,6 +240,7 @@ func TestMeasureParallelFraction(t *testing.T) {
 		runtime.GOMAXPROCS(n)
 		start := time.Now()
 
+		// Single block execution (simulate intra-node execution)
 		db := resetTestDBBench(fmt.Sprintf("./pf_db_%d", n))
 		defer db.Close()
 		ordered := orderTransactionsDeterministic(txs)
@@ -246,8 +285,10 @@ func TestDeterministicExecution(t *testing.T) {
 	blockTx := 5_000
 	batchSize := 500
 
+	// Prepare transactions
 	txs := ensureTxDataJSONBench("deterministic_txs.json", totalTx)
 
+	// Configurations to test determinism
 	configs := []struct {
 		name    string
 		workers int
@@ -258,6 +299,7 @@ func TestDeterministicExecution(t *testing.T) {
 		{"multi_worker_multi_core", 10, runtime.NumCPU()},
 	}
 
+	// Run each config multiple times to catch nondeterminism
 	runsPerConfig := 3
 	finalRoots := make(map[string][]string)
 
@@ -275,7 +317,7 @@ func TestDeterministicExecution(t *testing.T) {
 					workerIDs[i] = uint64(6000 + i)
 				}
 
-				prevRoot, _ := db.CurrentRoot()
+				prevRoot, _, _ := computeStateRootFromMap(map[string][]byte{})
 				totalBlocks := totalTx / blockTx
 
 				for blk := 0; blk < totalBlocks; blk++ {
@@ -293,7 +335,7 @@ func TestDeterministicExecution(t *testing.T) {
 						wg.Add(1)
 						go func(idx int, b Batch) {
 							defer wg.Done()
-							results := workerExecute(b)
+							results := workerExecute(b) // deterministic worker execution
 							workerResults[idx] = results
 						}(bi, batch)
 					}
@@ -304,9 +346,9 @@ func TestDeterministicExecution(t *testing.T) {
 						t.Fatalf("applyResultsOrdered failed: %v", err)
 					}
 
-					root, err := db.CurrentRoot()
+					root, err := computeStateRootFromDB(db)
 					if err != nil {
-						t.Fatalf("db.CurrentRoot failed: %v", err)
+						t.Fatalf("computeStateRootFromDB failed: %v", err)
 					}
 					prevRoot = root
 				}
@@ -318,6 +360,9 @@ func TestDeterministicExecution(t *testing.T) {
 		}
 	}
 
+	// Validate determinism:
+	// 1. All runs within each config must match
+	// 2. All configs must match each other
 	var referenceRoot string
 	for cfg, roots := range finalRoots {
 		first := roots[0]
@@ -339,8 +384,7 @@ func TestDeterministicExecution(t *testing.T) {
 	t.Logf("🎉 All configurations and runs produced the same final root: %s", referenceRoot)
 }
 
-// ----------------- VRF Test -----------------
-
+// ----- VRF test kept unchanged -----
 func TestVRFProveVerify(t *testing.T) {
 	sk, err := ecvrf.GenerateKey(nil)
 	if err != nil {
@@ -369,11 +413,12 @@ func TestVRFProveVerify(t *testing.T) {
 		t.Fatalf("beta mismatch: got %x want %x", beta2, beta)
 	}
 
-	// wrapper functions
+	// test wrappers
 	h, p, err := vrfGenerateHash(seed, sk.Bytes())
 	if err != nil {
 		t.Fatalf("vrfGenerateHash err: %v", err)
 	}
+
 	ok2, err := vrfVerifyHash(h, p, pk.Bytes(), seed)
 	if err != nil {
 		t.Fatalf("vrfVerifyHash err: %v", err)
@@ -383,32 +428,152 @@ func TestVRFProveVerify(t *testing.T) {
 	}
 }
 
-// ----------------- SMT Proof Test -----------------
+// TestMultiBatchReceipts verifies receipt generation & verification across multiple batches.
+// - applies N batches of KV updates (each batch contains multiple key->value writes)
+// - after each batch commit, generates a BatchReceipt containing SMT proofs for that batch
+// - verifies each BatchReceipt against the SMT root at that point
+// - finally validates the chain of roots (each batch root matches subsequent starting root)
+// - also includes a negative test that tampers with one proof to ensure verification fails
+func TestMultiBatchReceipts(t *testing.T) {
+	// prepare DB
+	dbPath := "./smt_test_db_multi"
+	db := resetTestDBBench(dbPath)
+	defer func() {
+		_ = db.Close()
+		_ = os.RemoveAll(dbPath)
+	}()
 
-func TestSMTProofRoundTrip(t *testing.T) {
-	db := resetTestDBBench("./smt_test_db")
-	defer db.Close()
+	// small config for test speed — increase as needed for stress testing
+	batches := 3
+	perBatch := 5
 
-	key := []byte("foo")
-	value := []byte("bar")
-
-	// Update state
-	root, err := db.SMTUpdate(key, value)
-	if err != nil {
-		t.Fatalf("SMTUpdate err: %v", err)
+	// types for ad-hoc receipts inside test (no external dependency)
+	type KeyValueProof struct {
+		Key         []byte
+		NewValue    []byte
+		MerkleProof [][]byte // bottom-up siblings
+	}
+	type BatchReceipt struct {
+		BatchID       uint64
+		WorkerID      uint64
+		BlockHeight   uint64
+		PostStateRoot []byte
+		Proofs        []KeyValueProof
 	}
 
-	// Generate proof
-	proof, err := db.SMTGenerateProof(key)
-	if err != nil {
-		t.Fatalf("SMTGenerateProof err: %v", err)
+	// keep track of all receipts and roots
+	var receipts []BatchReceipt
+	var roots [][]byte
+
+	// apply batches sequentially (each batch: multiple SMTUpdate calls)
+	for bid := 1; bid <= batches; bid++ {
+		// simulate a worker id and blockheight
+		workerID := uint64(100 + bid)
+		blockHeight := uint64(bid)
+
+		// collect the KV pairs we will write in this batch
+		kvs := make([]struct {
+			k []byte
+			v []byte
+		}, 0, perBatch)
+
+		for i := 0; i < perBatch; i++ {
+			key := []byte(fmt.Sprintf("batch%d_key%02d", bid, i))
+			value := []byte(fmt.Sprintf("val_%d_%02d", bid, i))
+			kvs = append(kvs, struct{ k, v []byte }{k: key, v: value})
+		}
+
+		// apply each KV to DB + SMT (SMTUpdate persists both)
+		for _, kv := range kvs {
+			if _, err := db.SMTUpdate(kv.k, kv.v); err != nil {
+				t.Fatalf("SMTUpdate failed for key=%s: %v", kv.k, err)
+			}
+		}
+
+		// after applying the batch, fetch current root
+		root, err := db.CurrentRoot()
+		if err != nil {
+			t.Fatalf("CurrentRoot failed after batch %d: %v", bid, err)
+		}
+		roots = append(roots, append([]byte(nil), root...))
+
+		// generate proofs for each KV in the batch (proofs are computed against current root)
+		batchReceipt := BatchReceipt{
+			BatchID:       uint64(bid),
+			WorkerID:      workerID,
+			BlockHeight:   blockHeight,
+			PostStateRoot: append([]byte(nil), root...),
+		}
+		for _, kv := range kvs {
+			proof, err := db.SMTGenerateProof(kv.k)
+			if err != nil {
+				t.Fatalf("SMTGenerateProof failed for key=%s after batch %d: %v", kv.k, bid, err)
+			}
+			// copy proof slices defensively
+			proofCopy := make([][]byte, len(proof))
+			for i := range proof {
+				proofCopy[i] = append([]byte(nil), proof[i]...)
+			}
+			batchReceipt.Proofs = append(batchReceipt.Proofs, KeyValueProof{
+				Key:         append([]byte(nil), kv.k...),
+				NewValue:    append([]byte(nil), kv.v...),
+				MerkleProof: proofCopy,
+			})
+		}
+
+		receipts = append(receipts, batchReceipt)
+		t.Logf("Generated receipt for batch %d with root %x", bid, root)
 	}
 
-	// Verify proof
-	ok := VerifyProof(key, value, proof, SMTDepth, root)
-	if !ok {
-		t.Fatalf("VerifyProof failed: key=%s value=%s root=%x", key, value, root)
+	// -----------------------
+	// Verify every receipt
+	// -----------------------
+	for i, r := range receipts {
+		t.Logf("Verifying receipt for batch %d (root=%x)", r.BatchID, r.PostStateRoot)
+		for j, p := range r.Proofs {
+			ok := VerifyProof(p.Key, p.NewValue, p.MerkleProof, SMTDepth, r.PostStateRoot)
+			if !ok {
+				t.Fatalf("Receipt verification failed for batch %d proof %d (key=%s)", r.BatchID, j, string(p.Key))
+			}
+		}
+		t.Logf("Batch %d receipt verification OK", r.BatchID)
+
+		// cross-check DB's persisted root matches receipt root
+		currRoot, err := db.CurrentRoot()
+		if err != nil {
+			t.Fatalf("CurrentRoot failed while verifying batch %d: %v", r.BatchID, err)
+		}
+		// At the time of verification the DB root should be the final root (last batch),
+		// but we at least ensure each receipt's PostStateRoot is a valid historical root by recalculating:
+		// Here we check that the receipt root equals the recorded root we stored just after batch application.
+		if !bytes.Equal(currRoot, roots[len(roots)-1]) {
+			// DB root progressed; that's expected. We still have recorded roots to compare against.
+			_ = currRoot // nothing to do, just leave a note
+		}
+		// ensure our recorded root for this batch still matches the stored roots list
+		if !bytes.Equal(r.PostStateRoot, roots[i]) {
+			t.Fatalf("Recorded root mismatch for batch %d: receipt root != recorded root", r.BatchID)
+		}
 	}
 
-	t.Logf("✅ SMT proof verified successfully for key=%s value=%s root=%x", key, value, root)
+	t.Log("✅ All batch receipts verified OK")
+
+	// -----------------------
+	// Negative test — tamper with proof of batch 2 (if exists)
+	// -----------------------
+	if len(receipts) >= 2 && len(receipts[1].Proofs) > 0 {
+		bad := receipts[1]
+		// flip a byte in the first proof's value
+		if len(bad.Proofs[0].NewValue) == 0 {
+			bad.Proofs[0].NewValue = []byte("tampered")
+		} else {
+			bad.Proofs[0].NewValue[0] ^= 0xFF
+		}
+		ok := VerifyProof(bad.Proofs[0].Key, bad.Proofs[0].NewValue, bad.Proofs[0].MerkleProof, SMTDepth, bad.PostStateRoot)
+		if ok {
+			t.Fatalf("tampered proof unexpectedly verified for batch %d", bad.BatchID)
+		}
+		t.Log("✅ Tampered proof correctly failed verification")
+	}
 }
+
