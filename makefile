@@ -1,87 +1,81 @@
-# ==== CONFIG ====
-LEADER_ID = leader1
-LEADER_PORT = 9000
-LEADER_KEY = leader1.key
-LEADER_BATCHSIZE = 1000
-LEADER_BATCHINTERVAL = 2s
-LEADER_BLOCKINTERVAL = 10s
-LEADER_QUEUEMON = 5s
+# Makefile for DeSync
 
-# Replace with actual leader peer-id after running `make leader`
-LEADER_PEERID = 12D3KooWBWaGuEJ2iKfuyAWMzsCQjxAAD4d11tLQHAEpgCLi9icx
+.PHONY: all list leader worker1 worker2 worker3 workers loadgen loadgen_http inspect clean
 
-LOADGEN_WORKERS = 10
-LOADGEN_RATE = 1000
-LOADGEN_TXCOUNT = 100000
+# Default
+all: leader worker1
 
-BLOCKS_DIR = blocks
+# List available targets
+list:
+	@echo "Available targets:"
+	@echo "  leader        - Start leader node (with API on :8080)"
+	@echo "  worker1       - Start worker1 (port 9001)"
+	@echo "  worker2       - Start worker2 (port 9002)"
+	@echo "  worker3       - Start worker3 (port 9003)"
+	@echo "  workers       - Start worker1, worker2, worker3"
+	@echo "  loadgen       - Run libp2p-based load generator (100k tx)"
+	@echo "  loadgen_http  - Run HTTP-based load generator (100k tx)"
+	@echo "  inspect       - Inspect committed blocks in ./blocks"
+	@echo "  clean         - Remove blocks/ and *.key files"
 
-# ==== TARGETS ====
-
-.PHONY: all leader worker1 worker2 worker3 worker4 loadgen inspect clean
-
-all: leader
-
+# Build commands
 leader:
-	@echo "🚀 Starting leader..."
 	go run ./cmd/node \
-	  --role=leader \
-	  --id=$(LEADER_ID) \
-	  --port=$(LEADER_PORT) \
-	  --keyfile=$(LEADER_KEY) \
-	  --batchsize=$(LEADER_BATCHSIZE) \
-	  --batchinterval=$(LEADER_BATCHINTERVAL) \
-	  --blockinterval=$(LEADER_BLOCKINTERVAL) \
-	  --queuemon=$(LEADER_QUEUEMON)
+		--role=leader \
+		--id=leader1 \
+		--port=9000 \
+		--keyfile=leader1.key \
+		--batchsize=1000 \
+		--batchinterval=2s \
+		--blockinterval=10s \
+		--queuemon=5s \
+		--apiport=8080
 
 worker1:
-	@echo "🚀 Starting worker1..."
 	go run ./cmd/node \
-	  --role=worker \
-	  --id=worker1 \
-	  --port=9001 \
-	  --keyfile=worker1.key \
-	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+		--role=worker \
+		--id=worker1 \
+		--port=9001 \
+		--keyfile=worker1.key \
+		--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID)
 
 worker2:
-	@echo "🚀 Starting worker2..."
 	go run ./cmd/node \
-	  --role=worker \
-	  --id=worker2 \
-	  --port=9002 \
-	  --keyfile=worker2.key \
-	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+		--role=worker \
+		--id=worker2 \
+		--port=9002 \
+		--keyfile=worker2.key \
+		--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID)
 
 worker3:
-	@echo "🚀 Starting worker3..."
 	go run ./cmd/node \
-	  --role=worker \
-	  --id=worker3 \
-	  --port=9003 \
-	  --keyfile=worker3.key \
-	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+		--role=worker \
+		--id=worker3 \
+		--port=9003 \
+		--keyfile=worker3.key \
+		--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID)
 
-worker4:
-	@echo "🚀 Starting worker4..."
-	go run ./cmd/node \
-	  --role=worker \
-	  --id=worker4 \
-	  --port=9004 \
-	  --keyfile=worker4.key \
-	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+workers: worker1 worker2 worker3
 
+# Load generators
 loadgen:
-	@echo "🚀 Starting load generator..."
 	go run ./cmd/loadgen \
-	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID) \
-	  --workers=$(LOADGEN_WORKERS) \
-	  --rate=$(LOADGEN_RATE) \
-	  --txcount=$(LOADGEN_TXCOUNT)
+		--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID) \
+		--workers=10 \
+		--rate=1000 \
+		--txcount=100000
 
+loadgen_http:
+	go run ./cmd/loadgen_http \
+		--api=http://127.0.0.1:8080 \
+		--workers=10 \
+		--rate=1000 \
+		--txcount=100000
+
+# Inspect committed blocks
 inspect:
-	@echo "🔎 Inspecting blocks in $(BLOCKS_DIR)..."
-	go run ./cmd/inspect --dir=$(BLOCKS_DIR)
+	go run ./cmd/inspect --dir=blocks
 
+# Clean build artifacts
 clean:
-	@echo "🧹 Cleaning block data and keys..."
-	rm -rf $(BLOCKS_DIR)
+	rm -rf blocks

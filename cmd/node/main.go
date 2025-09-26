@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MelzLabs/DeSync/api"
 	"github.com/MelzLabs/DeSync/consensus"
 	"github.com/MelzLabs/DeSync/network"
 )
@@ -23,6 +24,7 @@ var (
 	batchInterval  = flag.Duration("batchinterval", 2*time.Second, "batch flush interval")
 	blockInterval  = flag.Duration("blockinterval", 10*time.Second, "block creation interval")
 	queueInterval  = flag.Duration("queuemon", 5*time.Second, "queue monitor interval")
+	apiPortFlag    = flag.String("apiport", "8080", "port for HTTP API (leader only)")
 )
 
 func main() {
@@ -89,7 +91,15 @@ func startLeader(ctx context.Context, node *network.Node) {
 	go leader.StartQueueMonitor(ctx, *queueInterval)
 	go leader.BlockTicker(ctx, *blockInterval)
 
-	log.Printf("Node %s started as leader", *idFlag)
+	// ensure block dir exists
+	blockDir := "blocks"
+	_ = os.MkdirAll(blockDir, 0755)
+
+	// start HTTP API (explorer + tx submit)
+	apiServer := api.NewServer(node, leader.State, blockDir, ":"+*apiPortFlag)
+	go apiServer.Start()
+
+	log.Printf("Node %s started as leader with API on :%s", *idFlag, *apiPortFlag)
 }
 
 func startWorker(ctx context.Context, node *network.Node) {
