@@ -1,3 +1,13 @@
-*.dat
-cmd/kvapi/kvapi
-metadata
+node1.key
+node2.key
+node3.key
+node4.key
+node5.key
+worker1.key
+worker1.log
+worker2.key
+worker2.log
+worker3.key
+worker3.log
+leader.key
+leader1.key

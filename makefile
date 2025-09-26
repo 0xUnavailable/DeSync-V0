@@ -1,115 +1,87 @@
-# Makefile for running tests, benchmarks, and race detection
+# ==== CONFIG ====
+LEADER_ID = leader1
+LEADER_PORT = 9000
+LEADER_KEY = leader1.key
+LEADER_BATCHSIZE = 1000
+LEADER_BATCHINTERVAL = 2s
+LEADER_BLOCKINTERVAL = 10s
+LEADER_QUEUEMON = 5s
 
-.PHONY: test testv race bench bench-long all clean \
-        test-parallel test-deterministic test-vrf test-multibatch \
-        bench-unconstrained bench-constrained \
-        bench-unconstrained-20k bench-unconstrained-200k bench-unconstrained-1m \
-        bench-constrained-20k bench-constrained-200k bench-constrained-1m \
-        list
+# Replace with actual leader peer-id after running `make leader`
+LEADER_PEERID = 12D3KooWBWaGuEJ2iKfuyAWMzsCQjxAAD4d11tLQHAEpgCLi9icx
 
-# Run all tests (normal mode)
-test:
-	go test ./...
+LOADGEN_WORKERS = 10
+LOADGEN_RATE = 1000
+LOADGEN_TXCOUNT = 100000
 
-# Run all tests with verbose logs
-testv:
-	go test -v ./...
+BLOCKS_DIR = blocks
 
-# Run all tests with race detector enabled
-race:
-	go test -race -v ./...
+# ==== TARGETS ====
 
-# Run benchmarks only
-bench:
-	go test -bench=. ./...
+.PHONY: all leader worker1 worker2 worker3 worker4 loadgen inspect clean
 
-# Run benchmarks with longer time per test for stable numbers
-bench-long:
-	go test -bench=. -benchtime=30s ./...
+all: leader
 
-# Run both tests and benchmarks
-all:
-	go test -v -bench=. ./...
+leader:
+	@echo "🚀 Starting leader..."
+	go run ./cmd/node \
+	  --role=leader \
+	  --id=$(LEADER_ID) \
+	  --port=$(LEADER_PORT) \
+	  --keyfile=$(LEADER_KEY) \
+	  --batchsize=$(LEADER_BATCHSIZE) \
+	  --batchinterval=$(LEADER_BATCHINTERVAL) \
+	  --blockinterval=$(LEADER_BLOCKINTERVAL) \
+	  --queuemon=$(LEADER_QUEUEMON)
 
-# Clean up test caches & temp dirs
+worker1:
+	@echo "🚀 Starting worker1..."
+	go run ./cmd/node \
+	  --role=worker \
+	  --id=worker1 \
+	  --port=9001 \
+	  --keyfile=worker1.key \
+	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+
+worker2:
+	@echo "🚀 Starting worker2..."
+	go run ./cmd/node \
+	  --role=worker \
+	  --id=worker2 \
+	  --port=9002 \
+	  --keyfile=worker2.key \
+	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+
+worker3:
+	@echo "🚀 Starting worker3..."
+	go run ./cmd/node \
+	  --role=worker \
+	  --id=worker3 \
+	  --port=9003 \
+	  --keyfile=worker3.key \
+	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+
+worker4:
+	@echo "🚀 Starting worker4..."
+	go run ./cmd/node \
+	  --role=worker \
+	  --id=worker4 \
+	  --port=9004 \
+	  --keyfile=worker4.key \
+	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID)
+
+loadgen:
+	@echo "🚀 Starting load generator..."
+	go run ./cmd/loadgen \
+	  --connect=/ip4/127.0.0.1/tcp/$(LEADER_PORT)/p2p/$(LEADER_PEERID) \
+	  --workers=$(LOADGEN_WORKERS) \
+	  --rate=$(LOADGEN_RATE) \
+	  --txcount=$(LOADGEN_TXCOUNT)
+
+inspect:
+	@echo "🔎 Inspecting blocks in $(BLOCKS_DIR)..."
+	go run ./cmd/inspect --dir=$(BLOCKS_DIR)
+
 clean:
-	go clean -testcache
-	rm -rf bench_db_* pf_db_* deterministic_db_* *.csv
-	rm -rf smt_test_db_*
-	rm -rf deterministic_*
-	rm -rf bench_*
-	rm -rf pf_txs.json
-
-# -----------------------
-# Individual test targets
-# -----------------------
-
-test-parallel:
-	go test -v -run ^TestMeasureParallelFraction$$ ./...
-
-test-deterministic:
-	go test -v -run ^TestDeterministicExecution$$ ./...
-
-test-vrf:
-	go test -v -run ^TestVRFProveVerify$$ ./...
-
-test-multibatch:
-	go test -v -run ^TestMultiBatchReceipts$$ ./...
-
-# -----------------------
-# Individual benchmark targets
-# -----------------------
-
-bench-unconstrained:
-	go test -bench ^BenchmarkScalingUnconstrained$$ -benchmem ./...
-
-bench-constrained:
-	go test -bench ^BenchmarkScalingConstrained$$ -benchmem ./...
-
-bench-unconstrained-20k:
-	go test -bench ^BenchmarkScalingUnconstrained/20000tx_unconstrained$$ -benchmem ./...
-
-bench-unconstrained-200k:
-	go test -bench ^BenchmarkScalingUnconstrained/200000tx_unconstrained$$ -benchmem ./...
-
-bench-unconstrained-1m:
-	go test -bench ^BenchmarkScalingUnconstrained/1000000tx_unconstrained$$ -benchmem ./...
-
-bench-constrained-20k:
-	go test -bench ^BenchmarkScalingConstrained/20000tx_constrained$$ -benchmem ./...
-
-bench-constrained-200k:
-	go test -bench ^BenchmarkScalingConstrained/200000tx_constrained$$ -benchmem ./...
-
-bench-constrained-1m:
-	go test -bench ^BenchmarkScalingConstrained/1000000tx_constrained$$ -benchmem ./...
-
-# -----------------------
-# Utility
-# -----------------------
-
-list:
-	@echo ""
-	@echo "Available make targets:"
-	@echo "  test                → Run all tests"
-	@echo "  testv               → Run all tests with verbose output"
-	@echo "  race                → Run all tests with race detector"
-	@echo "  bench               → Run all benchmarks"
-	@echo "  bench-long          → Run benchmarks with 30s per test"
-	@echo "  all                 → Run tests + benchmarks"
-	@echo "  clean               → Cleanup temporary DBs and CSVs"
-	@echo ""
-	@echo "  test-parallel       → Run TestMeasureParallelFraction"
-	@echo "  test-deterministic  → Run TestDeterministicExecution"
-	@echo "  test-vrf            → Run TestVRFProveVerify"
-	@echo "  test-multibatch     → Run TestMultiBatchReceipts"
-	@echo ""
-	@echo "  bench-unconstrained       → Run all BenchmarkScalingUnconstrained cases (full parallelism, single commit per block)"
-	@echo "  bench-constrained         → Run all BenchmarkScalingConstrained cases (worker fluctuation, sequential per-batch commits)"
-	@echo "  bench-unconstrained-20k   → Run 20,000 tx unconstrained benchmark"
-	@echo "  bench-unconstrained-200k  → Run 200,000 tx unconstrained benchmark"
-	@echo "  bench-unconstrained-1m    → Run 1,000,000 tx unconstrained benchmark"
-	@echo "  bench-constrained-20k     → Run 20,000 tx constrained benchmark"
-	@echo "  bench-constrained-200k    → Run 200,000 tx constrained benchmark"
-	@echo "  bench-constrained-1m      → Run 1,000,000 tx constrained benchmark"
-	@echo ""
+	@echo "🧹 Cleaning block data and keys..."
+	rm -rf $(BLOCKS_DIR)

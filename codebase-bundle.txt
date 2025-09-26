@@ -1,0 +1,1926 @@
+--- FILE: consensus/leader.go ---
+package consensus
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/MelzLabs/DeSync/network"
+	"github.com/MelzLabs/DeSync/types"
+)
+
+// Leader is a single static leader (no rotation).
+type Leader struct {
+	ID      string
+	NetNode *network.Node
+
+	// tx queue
+	txQueueMu sync.Mutex
+	txQueue   []*types.Transaction
+
+	// pending batches
+	pendingMu           sync.Mutex
+	pendingBatchIDs     []string
+	pendingBatchTxs     map[string][]*types.Transaction
+	nextBatchSequential int
+
+	// simple block height
+	blockMu sync.Mutex
+	height  int
+}
+
+func NewLeader(id string) *Leader {
+	return &Leader{
+		ID:                 id,
+		txQueue:            make([]*types.Transaction, 0, 1024),
+		pendingBatchTxs:    make(map[string][]*types.Transaction),
+		pendingBatchIDs:    make([]string, 0),
+		nextBatchSequential: 0,
+	}
+}
+
+// === Worker registry ===
+func (l *Leader) StartWorkerRegistry(ctx context.Context) error {
+	sub, err := l.NetNode.WorkersTopic.Subscribe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			wh, err := network.DecodeWorkerHello(msg.Data)
+			if err != nil {
+				continue
+			}
+			log.Printf("Leader %s: observed worker %s (peer=%s)", l.ID, wh.WorkerID, wh.PeerID)
+		}
+	}()
+	return nil
+}
+
+// === Tx ingestion ===
+func (l *Leader) StartTxListener(ctx context.Context) error {
+	sub, err := l.NetNode.TxTopic.Subscribe()
+	if err != nil {
+		return err
+	}
+	log.Printf("Leader %s: subscribed to TxTopic", l.ID)
+
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			txm, err := network.DecodeTx(msg.Data)
+			if err != nil {
+				continue
+			}
+			tx := txm.Tx
+			if tx == nil {
+				continue
+			}
+			if !tx.VerifySignature() {
+				continue
+			}
+			l.enqueueTx(tx)
+		}
+	}()
+	return nil
+}
+
+func (l *Leader) enqueueTx(tx *types.Transaction) {
+	l.txQueueMu.Lock()
+	l.txQueue = append(l.txQueue, tx)
+	l.txQueueMu.Unlock()
+}
+
+func (l *Leader) dequeueBatch(max int) []*types.Transaction {
+	l.txQueueMu.Lock()
+	defer l.txQueueMu.Unlock()
+	if len(l.txQueue) == 0 {
+		return nil
+	}
+	n := max
+	if len(l.txQueue) < n {
+		n = len(l.txQueue)
+	}
+	batch := l.txQueue[:n]
+	l.txQueue = l.txQueue[n:]
+	return batch
+}
+
+// === Batch loop ===
+func (l *Leader) RunBatchLoop(ctx context.Context, batchSize int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	log.Printf("Leader %s: starting batch loop (batchSize=%d interval=%s)", l.ID, batchSize, interval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			txs := l.dequeueBatch(batchSize)
+			if len(txs) == 0 {
+				continue
+			}
+			batchID := fmt.Sprintf("batch-%d", l.nextBatchSequential)
+			l.nextBatchSequential++
+
+			l.pendingMu.Lock()
+			l.pendingBatchTxs[batchID] = txs
+			l.pendingBatchIDs = append(l.pendingBatchIDs, batchID)
+			l.pendingMu.Unlock()
+
+			bm := network.BatchMessage{
+				BatchID:      batchID,
+				Txs:          txs,
+				ShardIndex:   0,
+				ShardCount:   1,
+				TargetWorker: "",
+			}
+			data, _ := network.Encode(bm)
+			if err := l.NetNode.BatchTopic.Publish(ctx, data); err != nil {
+				log.Printf("Leader %s: publish batch error: %v", l.ID, err)
+			} else {
+				log.Printf("Leader %s: published batch %s (txs=%d)", l.ID, batchID, len(txs))
+			}
+		}
+	}
+}
+
+// === Results collector ===
+func (l *Leader) ListenResults(ctx context.Context) error {
+	sub, err := l.NetNode.ResultTopic.Subscribe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			_, _ = network.DecodeResult(msg.Data)
+		}
+	}()
+	return nil
+}
+
+// === Queue monitor ===
+func (l *Leader) StartQueueMonitor(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.txQueueMu.Lock()
+			q := len(l.txQueue)
+			l.txQueueMu.Unlock()
+			if q > 0 {
+				log.Printf("Leader %s: queue length=%d", l.ID, q)
+			}
+		}
+	}
+}
+
+// === Block ticker ===
+func (l *Leader) BlockTicker(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	blocksDir := "blocks"
+	_ = os.MkdirAll(blocksDir, 0755)
+	indexFile := filepath.Join(blocksDir, "index.json")
+
+	// load existing index if any
+	var index []map[string]interface{}
+	if data, err := os.ReadFile(indexFile); err == nil {
+		_ = json.Unmarshal(data, &index)
+	}
+
+	log.Printf("Leader %s: starting block ticker (interval=%s)", l.ID, interval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// advance height
+			l.blockMu.Lock()
+			l.height++
+			height := l.height
+			l.blockMu.Unlock()
+
+			// grab pending
+			l.pendingMu.Lock()
+			pendingIDs := l.pendingBatchIDs
+			batchesMap := l.pendingBatchTxs
+			l.pendingBatchIDs = nil
+			l.pendingBatchTxs = make(map[string][]*types.Transaction)
+			l.pendingMu.Unlock()
+
+			collected := make([]*types.Transaction, 0)
+			for _, bid := range pendingIDs {
+				if txs, ok := batchesMap[bid]; ok {
+					collected = append(collected, txs...)
+				}
+			}
+
+			// ✅ skip empty blocks
+			if len(collected) == 0 {
+				continue
+			}
+
+			blk := types.Block{
+				Height: height,
+				Txs:    collected,
+				Root:   []byte("dummy-root"),
+				Time:   time.Now(),
+			}
+
+			filename := fmt.Sprintf("block-%06d.json", blk.Height)
+			fullPath := filepath.Join(blocksDir, filename)
+			data, _ := json.MarshalIndent(blk, "", "  ")
+			if err := os.WriteFile(fullPath, data, 0644); err != nil {
+				log.Printf("Leader %s: failed to save block #%d: %v", l.ID, blk.Height, err)
+				continue
+			}
+
+			// update index.json
+			entry := map[string]interface{}{
+				"height":   blk.Height,
+				"filename": filename,
+				"txs":      len(collected),
+				"time":     blk.Time,
+			}
+			index = append(index, entry)
+			indexData, _ := json.MarshalIndent(index, "", "  ")
+			_ = os.WriteFile(indexFile, indexData, 0644)
+
+			log.Printf("Leader %s: committed block #%d (txs=%d)", l.ID, blk.Height, len(collected))
+		}
+	}
+}
+
+
+--- FILE: execution/sandbox.go ---
+package execution
+
+import (
+	"fmt"
+	"strconv"
+	"sync"
+	"github.com/MelzLabs/DeSync/types"
+)
+
+// SandboxedState simple key->value map for sandbox execution (thread-safe)
+type SandboxedState struct {
+	mu   sync.RWMutex
+	data map[string][]byte
+}
+
+func NewSandboxedState(snapshot map[string][]byte) *SandboxedState {
+	s := &SandboxedState{data: make(map[string][]byte)}
+	if snapshot != nil {
+		for k, v := range snapshot {
+			cp := make([]byte, len(v))
+			copy(cp, v)
+			s.data[k] = cp
+		}
+	}
+	return s
+}
+
+func (s *SandboxedState) Get(key string) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.data[key]
+	if !ok {
+		return nil, false
+	}
+	// Return a copy to prevent external modifications
+	cp := make([]byte, len(v))
+	copy(cp, v)
+	return cp, true
+}
+
+func (s *SandboxedState) Set(key string, value []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	s.data[key] = cp
+}
+
+// GetSnapshot returns a copy of all data (thread-safe)
+func (s *SandboxedState) GetSnapshot() map[string][]byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot := make(map[string][]byte, len(s.data))
+	for k, v := range s.data {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		snapshot[k] = cp
+	}
+	return snapshot
+}
+
+// DeclaredKeysFor returns deterministic keys touched by tx.
+func DeclaredKeysFor(tx *types.Transaction) []string {
+	switch tx.Action {
+	case "AllocateLand":
+		plotID := tx.Payload["plotID"]
+		return []string{
+			fmt.Sprintf("land:%s:owner", plotID),
+			fmt.Sprintf("land:%s:quota", plotID),
+			fmt.Sprintf("land:%s:resource", plotID),
+		}
+	case "Grow":
+		plotID := tx.Payload["plotID"]
+		return []string{
+			fmt.Sprintf("land:%s:resource", plotID),
+		}
+	case "Transfer":
+		from := tx.Payload["from"]
+		to := tx.Payload["to"]
+		return []string{
+			fmt.Sprintf("player:%s:balance", from),
+			fmt.Sprintf("player:%s:balance", to),
+		}
+	case "PayTax":
+		plotID := tx.Payload["plotID"]
+		return []string{
+			fmt.Sprintf("land:%s:owner", plotID),
+			fmt.Sprintf("player:%s:balance", tx.Sender),
+			fmt.Sprintf("land:%s:tax_paid", plotID),
+		}
+	default:
+		return []string{fmt.Sprintf("player:%s:balance", tx.Sender)}
+	}
+}
+
+// ApplyTransaction executes tx in sandbox and returns a TxResult.
+func ApplyTransaction(snap *SandboxedState, tx *types.Transaction, workerID string, index int) *types.TxResult {
+	res := &types.TxResult{
+		TxID: tx.ID,
+		Index: index,
+		Success: false,
+		WriteSet: make(map[string][]byte),
+		ExecutedBy: workerID,
+		DeclaredKeys: DeclaredKeysFor(tx),
+	}
+	
+	// Validate signature first
+	if !tx.VerifySignature() {
+		res.Error = "invalid signature"
+		return res
+	}
+	
+	switch tx.Action {
+	case "AllocateLand":
+		plotID := tx.Payload["plotID"]
+		owner := tx.Payload["owner"]
+		if plotID == "" || owner == "" {
+			res.Error = "missing plotID or owner"
+			return res
+		}
+		key := fmt.Sprintf("land:%s:owner", plotID)
+		if _, ok := snap.Get(key); ok {
+			res.Error = "plot allocated"
+			return res
+		}
+		res.WriteSet[key] = []byte(owner)
+		res.WriteSet[fmt.Sprintf("land:%s:quota", plotID)] = []byte("0")
+		res.WriteSet[fmt.Sprintf("land:%s:resource", plotID)] = []byte("0")
+		res.Events = append(res.Events, "Allocated:"+plotID)
+		res.Success = true
+		return res
+		
+	case "Grow":
+		plotID := tx.Payload["plotID"]
+		amtStr := tx.Payload["amount"]
+		if plotID == "" || amtStr == "" {
+			res.Error = "missing plotID or amount"
+			return res
+		}
+		amt, err := strconv.Atoi(amtStr)
+		if err != nil || amt <= 0 {
+			res.Error = "invalid amount"
+			return res
+		}
+		key := fmt.Sprintf("land:%s:resource", plotID)
+		curB, _ := snap.Get(key)
+		cur := 0
+		if curB != nil {
+			cur, _ = strconv.Atoi(string(curB))
+		}
+		new := cur + amt
+		res.WriteSet[key] = []byte(strconv.Itoa(new))
+		res.Events = append(res.Events, fmt.Sprintf("Grew:%s:%d", plotID, amt))
+		res.Success = true
+		return res
+		
+	case "Transfer":
+		from := tx.Payload["from"]
+		to := tx.Payload["to"]
+		amtStr := tx.Payload["amount"]
+		if from == "" || to == "" || amtStr == "" {
+			res.Error = "missing from/to/amount"
+			return res
+		}
+		amt, err := strconv.Atoi(amtStr)
+		if err != nil || amt <= 0 {
+			res.Error = "invalid amount"
+			return res
+		}
+		fromKey := fmt.Sprintf("player:%s:balance", from)
+		toKey := fmt.Sprintf("player:%s:balance", to)
+		fromB, _ := snap.Get(fromKey)
+		fromBal := 0
+		if fromB != nil {
+			fromBal, _ = strconv.Atoi(string(fromB))
+		}
+		if fromBal < amt {
+			res.Error = "insufficient balance"
+			return res
+		}
+		toB, _ := snap.Get(toKey)
+		toBal := 0
+		if toB != nil {
+			toBal, _ = strconv.Atoi(string(toB))
+		}
+		res.WriteSet[fromKey] = []byte(strconv.Itoa(fromBal-amt))
+		res.WriteSet[toKey] = []byte(strconv.Itoa(toBal+amt))
+		res.Events = append(res.Events, fmt.Sprintf("Transfer:%s->%s:%d", from, to, amt))
+		res.Success = true
+		return res
+		
+	case "PayTax":
+		plotID := tx.Payload["plotID"]
+		amountStr := tx.Payload["amount"]
+		if plotID == "" || amountStr == "" {
+			res.Error = "missing plotID/amount"
+			return res
+		}
+		amt, err := strconv.Atoi(amountStr)
+		if err != nil || amt < 0 {
+			res.Error = "invalid amount"
+			return res
+		}
+		ownerKey := fmt.Sprintf("land:%s:owner", plotID)
+		ownerB, ok := snap.Get(ownerKey)
+		if !ok || ownerB == nil {
+			res.Error = "plot not allocated"
+			return res
+		}
+		owner := string(ownerB)
+		ownerBalKey := fmt.Sprintf("player:%s:balance", owner)
+		bB, _ := snap.Get(ownerBalKey)
+		bal := 0
+		if bB != nil {
+			bal, _ = strconv.Atoi(string(bB))
+		}
+		if bal < amt {
+			res.Error = "insufficient balance to pay tax"
+			return res
+		}
+		res.WriteSet[ownerBalKey] = []byte(strconv.Itoa(bal-amt))
+		res.WriteSet[fmt.Sprintf("land:%s:tax_paid", plotID)] = []byte("true")
+		res.Events = append(res.Events, fmt.Sprintf("TaxPaid:%s:%d", plotID, amt))
+		res.Success = true
+		return res
+		
+	default:
+		res.Error = "unknown action"
+		return res
+	}
+}
+
+--- FILE: consensus/worker.go ---
+package consensus
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/MelzLabs/DeSync/execution"
+	"github.com/MelzLabs/DeSync/network"
+	"github.com/MelzLabs/DeSync/types"
+)
+
+// Worker executes batches, verifies tx signatures and publishes results.
+type Worker struct {
+	ID      string
+	NetNode *network.Node
+
+	privKey ed25519.PrivateKey
+	pubKey  ed25519.PublicKey
+
+	totalProcessed int64
+	totalShards    int64
+
+	processedMu sync.Mutex
+	processed   map[string]struct{}
+}
+
+func NewWorker(id string, node *network.Node) *Worker {
+	return &Worker{
+		ID:        id,
+		NetNode:   node,
+		processed: make(map[string]struct{}),
+	}
+}
+
+func (w *Worker) Start(ctx context.Context) error {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	w.privKey = priv
+	w.pubKey = priv.Public().(ed25519.PublicKey)
+
+	// initial hello (non-blocking)
+	wh := network.WorkerHello{
+		WorkerID: w.ID,
+		PubKey:   []byte(w.pubKey),
+		PeerID:   w.NetNode.Host.ID().String(),
+	}
+	if data, err := network.EncodeWorkerHello(wh); err == nil {
+		_ = w.NetNode.WorkersTopic.Publish(ctx, data)
+	}
+
+	// subscribe to leader heartbeats (just to log, passive)
+	if sub, err := w.NetNode.LeaderTopic.Subscribe(); err == nil {
+		go func() {
+			for {
+				msg, err := sub.Next(ctx)
+				if err != nil {
+					return
+				}
+				ann, err := network.DecodeLeaderAnnounce(msg.Data)
+				if err != nil {
+					continue
+				}
+				log.Printf("Worker %s: leader heartbeat from %s (epoch=%d)", w.ID, ann.LeaderID, ann.Epoch)
+			}
+		}()
+	}
+
+	// performance monitor
+	go w.startPerformanceMonitor(ctx)
+
+	// subscribe to batch topic
+	sub, err := w.NetNode.BatchTopic.Subscribe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			bm, err := network.DecodeBatch(msg.Data)
+			if err != nil {
+				continue
+			}
+			// if the batch targeted a specific worker, skip if not me
+			if bm.TargetWorker != "" && bm.TargetWorker != w.ID {
+				continue
+			}
+			go w.processShard(ctx, bm)
+		}
+	}()
+
+	return nil
+}
+
+func (w *Worker) startPerformanceMonitor(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			processed := atomic.LoadInt64(&w.totalProcessed)
+			shards := atomic.LoadInt64(&w.totalShards)
+			if shards > 0 {
+				avg := float64(processed) / float64(shards)
+				log.Printf("Worker %s STATS: processed=%d txs, shards=%d, avg=%.2f",
+					w.ID, processed, shards, avg)
+			}
+		}
+	}
+}
+
+func (w *Worker) processShard(ctx context.Context, bm *network.BatchMessage) {
+	key := bm.BatchID + "-" + string(rune(bm.ShardIndex))
+	w.processedMu.Lock()
+	if _, seen := w.processed[key]; seen {
+		w.processedMu.Unlock()
+		return
+	}
+	w.processed[key] = struct{}{}
+	w.processedMu.Unlock()
+
+	start := time.Now()
+	atomic.AddInt64(&w.totalShards, 1)
+
+	// create sandbox state from snapshot (may be nil)
+	snap := execution.NewSandboxedState(bm.Snapshot)
+	results := make([]*types.TxResult, len(bm.Txs))
+
+	var wg sync.WaitGroup
+	wg.Add(len(bm.Txs))
+	for i, tx := range bm.Txs {
+		i, tx := i, tx
+		go func() {
+			defer wg.Done()
+			// verify tx signature
+			if !tx.VerifySignature() {
+				results[i] = &types.TxResult{
+					TxID:    tx.ID,
+					Index:   i,
+					Success: false,
+					Error:   "invalid signature",
+				}
+				return
+			}
+			// execute
+			results[i] = execution.ApplyTransaction(snap, tx, w.ID, i)
+		}()
+	}
+	wg.Wait()
+	atomic.AddInt64(&w.totalProcessed, int64(len(bm.Txs)))
+	elapsed := time.Since(start)
+
+	// minimal shard summary log
+	log.Printf("Worker %s: finished shard %d/%d batch %s (txs=%d elapsed=%s)",
+		w.ID, bm.ShardIndex+1, bm.ShardCount, bm.BatchID, len(bm.Txs), elapsed)
+
+	// sign results blob
+	toSign := struct {
+		BatchID    string
+		WorkerID   string
+		ShardIndex int
+		ShardCount int
+		Results    []*types.TxResult
+	}{
+		BatchID:    bm.BatchID,
+		WorkerID:   w.ID,
+		ShardIndex: bm.ShardIndex,
+		ShardCount: bm.ShardCount,
+		Results:    results,
+	}
+	payload, _ := json.Marshal(toSign)
+	sig := ed25519.Sign(w.privKey, payload)
+
+	sr := network.SignedResult{
+		BatchID:    bm.BatchID,
+		WorkerID:   w.ID,
+		ShardIndex: bm.ShardIndex,
+		ShardCount: bm.ShardCount,
+		Results:    results,
+		PubKey:     []byte(w.pubKey),
+		Sig:        sig,
+	}
+	data, _ := network.EncodeResult(sr)
+	_ = w.NetNode.ResultTopic.Publish(ctx, data)
+}
+
+
+--- FILE: consensus/batch_test.go ---
+package consensus
+
+import (
+	"crypto/ed25519"
+	//"time"
+
+	"github.com/MelzLabs/DeSync/types"
+)
+
+// helper: create a signed tx
+func makeSigned(sender string, priv ed25519.PrivateKey, nonce uint64, action string, payload map[string]string) *types.Transaction {
+	tx := types.NewTxn(sender, action, payload)
+	tx.Nonce = nonce
+	tx.Sign(priv)
+	return tx
+}
+
+// func TestPartitionBatch(t *testing.T) {
+// 	// Create some test transactions
+// 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	
+// 	txs := []*types.Transaction{
+// 		makeSigned("alice", priv, 1, "Grow", map[string]string{"plotID": "p1", "amount": "1"}),
+// 		makeSigned("bob", priv, 1, "Grow", map[string]string{"plotID": "p2", "amount": "1"}),
+// 		makeSigned("alice", priv, 2, "Grow", map[string]string{"plotID": "p1", "amount": "2"}),
+// 		makeSigned("charlie", priv, 1, "Transfer", map[string]string{"from": "charlie", "to": "dave", "amount": "10"}),
+// 	}
+	
+// 	shards := partitionBatch(txs)
+	
+// 	if len(shards) < 2 {
+// 		t.Fatalf("Expected at least 2 shards due to conflicts, got %d", len(shards))
+// 	}
+	
+// 	// Verify that conflicting transactions are in different shards
+// 	// tx[0] and tx[2] both touch plotID p1, so they should be in different shards
+// 	found0, found2 := -1, -1
+// 	for i, shard := range shards {
+// 		for _, tx := range shard {
+// 			if tx.ID == txs[0].ID {
+// 				found0 = i
+// 			}
+// 			if tx.ID == txs[2].ID {
+// 				found2 = i
+// 			}
+// 		}
+// 	}
+	
+// 	if found0 == found2 {
+// 		t.Errorf("Conflicting transactions should be in different shards, both in shard %d", found0)
+// 	}
+// }
+
+// Stress test: submit 10k txs and measure throughput
+// Uncomment and modify as needed for testing
+/*
+func TestStressBatch10000(t *testing.T) {
+	const totalTx = 10000
+	const batchSize = 500
+	const workers = 8
+
+	// set up leader + smt
+	smt := state.NewSparseMerkleTree()
+	leader := NewLeader("leader-stress", workers, smt)
+
+	// generate keypair for alice
+	_, privA, _ := ed25519.GenerateKey(rand.Reader)
+
+	// init alice with high balance
+	leader.StateInit("alice", 1000000)
+
+	// submit txs in a goroutine so BatchAndExecute can consume concurrently
+	submitDone := make(chan struct{})
+	go func() {
+		for i := 0; i < totalTx; i++ {
+			tx := makeSigned("alice", privA, uint64(i), "Grow",
+				map[string]string{"plotID": "p1", "amount": "1"})
+			if err := leader.SubmitTx(tx); err != nil {
+				t.Fatalf("submit tx err: %v", err)
+			}
+		}
+		close(submitDone)
+	}()
+
+	// consume batches until we've processed all txs
+	start := time.Now()
+	processed := 0
+	for processed < totalTx {
+		rec, err := leader.BatchAndExecute(batchSize, 200*time.Millisecond)
+		if err != nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		for _, r := range rec.TxResults {
+			if r != nil && r.Success {
+				processed++
+			}
+		}
+		if processed%2500 == 0 {
+			fmt.Printf("processed %d/%d\n", processed, totalTx)
+		}
+	}
+	elapsed := time.Since(start)
+	t.Logf("Processed %d txs in %s (workers=%d)", totalTx, elapsed, workers)
+
+	// final check: last-write-wins means value is nondeterministic.
+	// Just ensure a valid proof exists for the final stored value.
+	proof, err := smt.Prove([]byte("land:p1:resource"))
+	if err != nil {
+		t.Fatalf("prove err: %v", err)
+	}
+
+	snap := smt.ExportSnapshot()
+	val, ok := snap["land:p1:resource"]
+	if !ok {
+		t.Fatalf("resource key missing from snapshot")
+	}
+
+	if !state.VerifyProof(proof, smt.GetRoot(), []byte("land:p1:resource"), val) {
+		t.Fatalf("final proof failed: root/proof mismatch for resource")
+	}
+}
+*/
+
+--- FILE: cmd/loadgen/main.go ---
+package main
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"flag"
+	"fmt"
+	"log"
+	mrand "math/rand"
+	"sync/atomic"
+	"time"
+
+	"github.com/MelzLabs/DeSync/network"
+	"github.com/MelzLabs/DeSync/types"
+	"github.com/libp2p/go-libp2p/core/crypto"
+)
+
+var actions = []string{"allocate", "transfer", "paytax"}
+
+func randomPayload(action string) map[string]string {
+	args := map[string]string{}
+	switch action {
+	case "allocate":
+		args["plot"] = fmt.Sprintf("plot-%d", mrand.Intn(100000))
+	case "transfer":
+		args["to"] = fmt.Sprintf("player%d", mrand.Intn(1000))
+		args["amount"] = fmt.Sprintf("%d", mrand.Intn(1000)+1)
+	case "paytax":
+		args["plot"] = fmt.Sprintf("plot-%d", mrand.Intn(100000))
+		args["amount"] = fmt.Sprintf("%d", mrand.Intn(100)+1)
+	}
+	return args
+}
+
+func main() {
+	connect := flag.String("connect", "", "multiaddr to bootstrap connect (any node)")
+	workers := flag.Int("workers", 5, "number of tx senders")
+	rate := flag.Int("rate", 100, "tx per second per worker")
+	txCount := flag.Int("txcount", 0, "total number of transactions to send (0 = unlimited)")
+	flag.Parse()
+
+	if *connect == "" {
+		log.Fatal("need --connect")
+	}
+
+	ctx := context.Background()
+
+	// libp2p node identity
+	lp2pPriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	node, err := network.NewNodeWithKey(ctx, "/ip4/0.0.0.0/tcp/0", lp2pPriv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := node.Connect(ctx, *connect); err != nil {
+		log.Fatal(err)
+	}
+
+	// tx signing key
+	_, txPriv, _ := ed25519.GenerateKey(rand.Reader)
+
+	mrand.Seed(time.Now().UnixNano())
+	log.Printf("Starting loadgen with %d workers at %d tx/s each (target=%d)", *workers, *rate, *txCount)
+
+	total := int64(*txCount)
+	var sent int64
+
+	// - - - Leader rotation tracking - - -
+	go func() {
+		sub, err := node.LeaderTopic.Subscribe()
+		if err != nil {
+			log.Fatalf("failed to subscribe to leader topic: %v", err)
+		}
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			ann, err := network.DecodeLeaderAnnounce(msg.Data)
+			if err != nil {
+				continue
+			}
+			log.Printf("Loadgen: observed new leader=%s epoch=%d", ann.LeaderID, ann.Epoch)
+			// (Optional) You could trigger reconnects if publishing directly to leader-only topics.
+			// Here, since we're publishing on TxTopic (gossip), it's enough to just note leader change.
+		}
+	}()
+
+	// - - - Workers sending tx - - -
+	for w := 0; w < *workers; w++ {
+		go func(id int) {
+			sender := fmt.Sprintf("player%d", id)
+			ticker := time.NewTicker(time.Second / time.Duration(*rate))
+			defer ticker.Stop()
+
+			for range ticker.C {
+				if total > 0 && atomic.LoadInt64(&sent) >= total {
+					return
+				}
+
+				action := actions[mrand.Intn(len(actions))]
+				payload := randomPayload(action)
+
+				tx := types.NewTxn(sender, action, payload)
+				tx.Nonce = uint64(time.Now().UnixNano())
+				if err := tx.Sign(txPriv); err != nil {
+					continue
+				}
+
+				msg := network.TxMessage{Tx: tx}
+				data, _ := network.EncodeTx(msg)
+				_ = node.TxTopic.Publish(ctx, data)
+				atomic.AddInt64(&sent, 1)
+			}
+		}(w)
+	}
+
+	// Exit when done
+	if total > 0 {
+		for {
+			if atomic.LoadInt64(&sent) >= total {
+				log.Printf("Loadgen finished: sent %d transactions", total)
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+	} else {
+		select {}
+	}
+}
+
+
+--- FILE: cmd/node/main.go ---
+package main
+
+import (
+	"context"
+	"flag"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/MelzLabs/DeSync/consensus"
+	"github.com/MelzLabs/DeSync/network"
+)
+
+var (
+	roleFlag       = flag.String("role", "worker", "node role: leader or worker")
+	idFlag         = flag.String("id", "", "node id (required)")
+	portFlag       = flag.String("port", "9000", "listen port")
+	connectFlag    = flag.String("connect", "", "multiaddr to connect (optional)")
+	keyfileFlag    = flag.String("keyfile", "", "keyfile for identity (optional)")
+	batchSizeFlag  = flag.Int("batchsize", 1000, "batch size for leader")
+	batchInterval  = flag.Duration("batchinterval", 2*time.Second, "batch flush interval")
+	blockInterval  = flag.Duration("blockinterval", 10*time.Second, "block creation interval")
+	queueInterval  = flag.Duration("queuemon", 5*time.Second, "queue monitor interval")
+)
+
+func main() {
+	flag.Parse()
+
+	if *idFlag == "" {
+		log.Fatal("need --id flag")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// load or create key
+	priv, err := network.LoadOrCreatePrivKey(*keyfileFlag)
+	if err != nil {
+		log.Fatalf("failed to load/create key: %v", err)
+	}
+	addr := "/ip4/0.0.0.0/tcp/" + *portFlag
+	node, err := network.NewNodeWithKey(ctx, addr, priv)
+	if err != nil {
+		log.Fatalf("failed to create node: %v", err)
+	}
+	log.Printf("Node started with peer ID: %s, listening on %s", node.Host.ID().String(), addr)
+
+	// optional bootstrap
+	if *connectFlag != "" {
+		if err := node.Connect(ctx, *connectFlag); err != nil {
+			log.Printf("Warning: failed to connect to %s: %v", *connectFlag, err)
+		}
+	}
+
+	switch *roleFlag {
+	case "leader":
+		startLeader(ctx, node)
+	case "worker":
+		startWorker(ctx, node)
+	default:
+		log.Fatalf("unknown role: %s", *roleFlag)
+	}
+
+	// wait for signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Println("Shutting down node...")
+}
+
+func startLeader(ctx context.Context, node *network.Node) {
+	leader := consensus.NewLeader(*idFlag)
+	leader.NetNode = node
+
+	if err := leader.StartWorkerRegistry(ctx); err != nil {
+		log.Fatalf("StartWorkerRegistry failed: %v", err)
+	}
+	if err := leader.StartTxListener(ctx); err != nil {
+		log.Fatalf("StartTxListener failed: %v", err)
+	}
+	if err := leader.ListenResults(ctx); err != nil {
+		log.Fatalf("ListenResults failed: %v", err)
+	}
+
+	// run leader loops
+	go leader.RunBatchLoop(ctx, *batchSizeFlag, *batchInterval)
+	go leader.StartQueueMonitor(ctx, *queueInterval)
+	go leader.BlockTicker(ctx, *blockInterval)
+
+	log.Printf("Node %s started as leader", *idFlag)
+}
+
+func startWorker(ctx context.Context, node *network.Node) {
+	worker := consensus.NewWorker(*idFlag, node)
+	if err := worker.Start(ctx); err != nil {
+		log.Fatalf("worker start failed: %v", err)
+	}
+	log.Printf("Node %s started as worker", *idFlag)
+}
+
+
+--- FILE: state/smt_test.go ---
+package state
+
+import (
+	"bytes"
+	"fmt"
+	"testing"
+)
+
+func TestSMTRoundTrip_MultipleKeys(t *testing.T) {
+	s := NewSparseMerkleTree()
+
+	// Insert 10 keys and values
+	keys := make([][]byte, 10)
+	values := make([][]byte, 10)
+	for i := 0; i < 10; i++ {
+		keys[i] = []byte(fmt.Sprintf("key-%d", i))
+		values[i] = []byte(fmt.Sprintf("val-%d", i))
+		s.Update(keys[i], values[i])
+	}
+
+	root := s.GetRoot()
+	if len(root) == 0 {
+		t.Fatal("expected non-empty root after inserts")
+	}
+
+	// Verify all proofs
+	for i := 0; i < 10; i++ {
+		proof, err := s.Prove(keys[i])
+		if err != nil {
+			t.Fatalf("failed to prove key-%d: %v", i, err)
+		}
+		if !VerifyProof(proof, root, keys[i], values[i]) {
+			t.Fatalf("proof failed for key-%d", i)
+		}
+	}
+
+	// Negative test: wrong value must fail
+	proof, _ := s.Prove(keys[0])
+	if VerifyProof(proof, root, keys[0], []byte("wrong-val")) {
+		t.Fatal("expected failure with wrong value")
+	}
+}
+
+func TestSMT_EmptyRootDeterminism(t *testing.T) {
+	s1 := NewSparseMerkleTree()
+	s2 := NewSparseMerkleTree()
+
+	root1 := s1.GetRoot()
+	root2 := s2.GetRoot()
+
+	if !bytes.Equal(root1, root2) {
+		t.Fatal("empty roots should match")
+	}
+}
+
+func TestSMT_ConsistencyAfterUpdate(t *testing.T) {
+	s := NewSparseMerkleTree()
+
+	key := []byte("land-123")
+	val1 := []byte("owner-A")
+	val2 := []byte("owner-B")
+
+	s.Update(key, val1)
+	root1 := s.GetRoot()
+
+	proof1, _ := s.Prove(key)
+	if !VerifyProof(proof1, root1, key, val1) {
+		t.Fatal("proof for val1 failed")
+	}
+
+	// Update same key with new value
+	s.Update(key, val2)
+	root2 := s.GetRoot()
+
+	if bytes.Equal(root1, root2) {
+		t.Fatal("root should change after update")
+	}
+
+	proof2, _ := s.Prove(key)
+	if !VerifyProof(proof2, root2, key, val2) {
+		t.Fatal("proof for val2 failed after update")
+	}
+}
+
+func TestSMT_IndependentKeys(t *testing.T) {
+	s := NewSparseMerkleTree()
+
+	keyA, valA := []byte("plot-A"), []byte("val-A")
+	keyB, valB := []byte("plot-B"), []byte("val-B")
+
+	s.Update(keyA, valA)
+	root1 := s.GetRoot()
+
+	s.Update(keyB, valB)
+	root2 := s.GetRoot()
+
+	if bytes.Equal(root1, root2) {
+		t.Fatal("roots should differ after adding new key")
+	}
+
+	// Both proofs must verify against the latest root
+	proofA, _ := s.Prove(keyA)
+	if !VerifyProof(proofA, root2, keyA, valA) {
+		t.Fatal("proof for A failed on updated root")
+	}
+
+	proofB, _ := s.Prove(keyB)
+	if !VerifyProof(proofB, root2, keyB, valB) {
+		t.Fatal("proof for B failed on updated root")
+	}
+}
+
+
+--- FILE: network/network.go ---
+package network
+
+import (
+	"context"
+	"encoding/hex"
+	"log"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	mdns "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+)
+
+// Node wraps libp2p host and pubsub topics.
+type Node struct {
+	Host         host.Host
+	PubSub       *pubsub.PubSub
+	WorkersTopic *pubsub.Topic
+	TxTopic      *pubsub.Topic
+	BatchTopic   *pubsub.Topic
+	ResultTopic  *pubsub.Topic
+	LeaderTopic  *pubsub.Topic
+}
+
+
+
+// NewNodeWithKey starts a libp2p node with given privkey
+func NewNodeWithKey(ctx context.Context, listenAddr string, priv crypto.PrivKey) (*Node, error) {
+	h, err := libp2p.New(
+		libp2p.ListenAddrStrings(listenAddr),
+		libp2p.Identity(priv),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		return nil, err
+	}
+
+	workersTopic, _ := ps.Join("workers")
+	txTopic, _ := ps.Join("txs")
+	batchTopic, _ := ps.Join("batches")
+	resultTopic, _ := ps.Join("results")
+	leaderTopic, _ := ps.Join("leader")
+
+	n := &Node{
+		Host:         h,
+		PubSub:       ps,
+		WorkersTopic: workersTopic,
+		TxTopic:      txTopic,
+		BatchTopic:   batchTopic,
+		ResultTopic:  resultTopic,
+		LeaderTopic:  leaderTopic,
+	}
+
+	// MDNS discovery (local dev)
+	ser := mdns.NewMdnsService(h, "desync-mdns", &discoveryNotifee{h: h})
+	if err != nil {
+		log.Printf("mdns disabled: %v", err)
+	} else {
+		_ = ser
+	}
+
+	log.Printf("Node started with peer ID: %s, listening on %s", h.ID().String(), listenAddr)
+	return n, nil
+}
+
+type discoveryNotifee struct {
+	h host.Host
+}
+
+func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == n.h.ID() {
+		return
+	}
+	if err := n.h.Connect(context.Background(), pi); err == nil {
+		log.Printf("Connected to peer %s", pi.ID)
+	}
+}
+
+// Connect to a bootstrap peer
+func (n *Node) Connect(ctx context.Context, addr string) error {
+	pi, err := peer.AddrInfoFromString(addr)
+	if err != nil {
+		return err
+	}
+	if err := n.Host.Connect(ctx, *pi); err != nil {
+		return err
+	}
+	log.Printf("Connected to %s", pi.ID.String())
+	return nil
+}
+
+// GetPeerIDHex returns peer id as hex
+func (n *Node) GetPeerIDHex() string {
+	return hex.EncodeToString([]byte(n.Host.ID()))
+}
+
+
+--- FILE: network/messages.go ---
+package network
+
+import (
+	"encoding/json"
+
+	"github.com/MelzLabs/DeSync/types"
+)
+
+// - - - Worker Hello - - -
+
+type WorkerHello struct {
+	WorkerID string `json:"worker_id"`
+	PeerID   string `json:"peer_id"`
+	PubKey   []byte `json:"pub_key"`
+}
+
+
+func EncodeWorkerHello(m WorkerHello) ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func DecodeWorkerHello(b []byte) (*WorkerHello, error) {
+	var m WorkerHello
+	err := json.Unmarshal(b, &m)
+	return &m, err
+}
+
+// - - - Transactions - - -
+
+type TxMessage struct {
+	Tx *types.Transaction `json:"tx"`
+}
+
+func EncodeTx(m TxMessage) ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func DecodeTx(b []byte) (*TxMessage, error) {
+	var m TxMessage
+	err := json.Unmarshal(b, &m)
+	return &m, err
+}
+
+// - - - Batch Messages - - -
+
+type BatchMessage struct {
+	BatchID      string               `json:"batch_id"`
+	Txs          []*types.Transaction `json:"txs"`
+	TargetWorker string               `json:"target_worker"`
+	Snapshot     map[string][]byte    `json:"snapshot,omitempty"`
+	ShardIndex   int                  `json:"shard_index"`
+	ShardCount   int                  `json:"shard_count"`
+}
+
+func Encode(m BatchMessage) ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func DecodeBatch(b []byte) (*BatchMessage, error) {
+	var m BatchMessage
+	err := json.Unmarshal(b, &m)
+	return &m, err
+}
+
+// - - - Results - - -
+
+type SignedResult struct {
+	BatchID    string             `json:"batch_id"`
+	WorkerID   string             `json:"worker_id"`
+	ShardIndex int                `json:"shard_index"`
+	ShardCount int                `json:"shard_count"`
+	Results    []*types.TxResult  `json:"results"`
+	Sig        []byte             `json:"sig"`	
+	PubKey     []byte             `json:"pubkey"`
+
+}
+
+func EncodeResult(m SignedResult) ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func DecodeResult(b []byte) (*SignedResult, error) {
+	var m SignedResult
+	err := json.Unmarshal(b, &m)
+	return &m, err
+}
+
+// - - - Leader Announce - - -
+
+type LeaderAnnounce struct {
+	LeaderID string `json:"leader_id"`
+	Epoch    int    `json:"epoch"`
+}
+
+func EncodeLeaderAnnounce(m LeaderAnnounce) ([]byte, error) {
+	return json.Marshal(m)
+}
+
+func DecodeLeaderAnnounce(b []byte) (*LeaderAnnounce, error) {
+	var m LeaderAnnounce
+	err := json.Unmarshal(b, &m)
+	return &m, err
+}
+
+
+--- FILE: types/tx.go ---
+package types
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"sort"
+	"strings"
+)
+
+// Transaction represents a simple action.
+type Transaction struct {
+	ID      string
+	Sender  string
+	Nonce   uint64
+	Action  string
+	Payload map[string]string
+	PubKey  []byte
+	Sig     []byte
+}
+
+func NewTxn(sender, action string, payload map[string]string) *Transaction {
+	idb := make([]byte, 8)
+	_, _ = rand.Read(idb)
+	var payloadCopy map[string]string
+	if payload != nil {
+		payloadCopy = make(map[string]string, len(payload))
+		for k, v := range payload {
+			payloadCopy[k] = v
+		}
+	}
+	return &Transaction{
+		ID:      hex.EncodeToString(idb),
+		Sender:  sender,
+		Action:  action,
+		Payload: payloadCopy,
+	}
+}
+
+func (t *Transaction) MsgBytes() []byte {
+	var sb strings.Builder
+	sb.WriteString(t.Sender)
+	sb.WriteString("|")
+	sb.WriteString(t.Action)
+	sb.WriteString("|")
+	if t.Payload != nil {
+		keys := make([]string, 0, len(t.Payload))
+		for k := range t.Payload {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			sb.WriteString(k)
+			sb.WriteString("=")
+			sb.WriteString(t.Payload[k])
+			sb.WriteString(";")
+		}
+	}
+	return []byte(sb.String())
+}
+
+func (t *Transaction) Sign(priv ed25519.PrivateKey) error {
+	sig := ed25519.Sign(priv, t.MsgBytes())
+	pk := priv.Public().(ed25519.PublicKey)
+	t.PubKey = make([]byte, len(pk))
+	copy(t.PubKey, pk)
+	t.Sig = make([]byte, len(sig))
+	copy(t.Sig, sig)
+	return nil
+}
+
+func (t *Transaction) VerifySignature() bool {
+	if len(t.PubKey) == 0 || len(t.Sig) == 0 {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(t.PubKey), t.MsgBytes(), t.Sig)
+}
+
+// TxResult returned by worker for each tx.
+type TxResult struct {
+	TxID        string
+	Index       int
+	Success     bool
+	Error       string
+	WriteSet    map[string][]byte
+	Events      []string
+	ExecutedBy  string
+	DeclaredKeys []string
+}
+
+// BatchReceipt is created by leader when committing.
+type BatchReceipt struct {
+	BatchID         string
+	Root            []byte
+	TxResults       []*TxResult
+	WorkerSignatures map[string][]byte
+}
+
+
+--- FILE: state/memstore.go ---
+package state
+
+import (
+	"crypto/sha256"
+	"sort"
+	"sync"
+)
+
+// MemStore is a simple in-memory key-value store used for testing.
+type MemStore struct {
+	mu sync.RWMutex
+	kv map[string][]byte
+}
+
+func NewMemStore() *MemStore {
+	return &MemStore{kv: make(map[string][]byte)}
+}
+
+func (m *MemStore) Get(key []byte) ([]byte, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	v, ok := m.kv[string(key)]
+	if !ok {
+		return nil, false
+	}
+	cp := make([]byte, len(v))
+	copy(cp, v)
+	return cp, true
+}
+
+func (m *MemStore) Set(key []byte, val []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([]byte, len(val))
+	copy(cp, val)
+	m.kv[string(key)] = cp
+}
+
+// ExportSnapshot returns a copy of the internal kv map for snapshotting.
+func (m *MemStore) ExportSnapshot() map[string][]byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string][]byte, len(m.kv))
+	for k, v := range m.kv {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+// RootHash returns a deterministic hash (SHA-256) of the current store.
+// It sorts keys lexicographically and concatenates (key || 0x00 || value || 0x00)
+// for each pair, then returns sha256(sum).
+// This is NOT a Merkle root — it's a deterministic snapshot hash suitable for testing.
+func (m *MemStore) RootHash() []byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// collect keys and sort for deterministic ordering
+	keys := make([]string, 0, len(m.kv))
+	for k := range m.kv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write(m.kv[k])
+		h.Write([]byte{0})
+	}
+	sum := h.Sum(nil)
+	// return a copy
+	out := make([]byte, len(sum))
+	copy(out, sum)
+	return out
+}
+
+
+--- FILE: state/smt.go ---
+package state
+
+import (
+	"crypto/sha256"
+	"sync"
+
+	celsmt "github.com/celestiaorg/smt"
+)
+
+// SparseMerkleTree wraps celestiaorg/smt with an in-memory KV mirror.
+type SparseMerkleTree struct {
+	tree *celsmt.SparseMerkleTree
+
+	mu sync.RWMutex
+	kv map[string][]byte
+}
+
+// NewSparseMerkleTree creates a new in-memory SMT.
+func NewSparseMerkleTree() *SparseMerkleTree {
+	store := celsmt.NewSimpleMap()
+	tree := celsmt.NewSparseMerkleTree(store, store, sha256.New())
+	return &SparseMerkleTree{
+		tree: tree,
+		kv:   make(map[string][]byte),
+	}
+}
+
+// Update inserts/updates a key and mirrors it in kv.
+func (s *SparseMerkleTree) Update(key, value []byte) error {
+	if _,err := s.tree.Update(key, value); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	s.kv[string(key)] = cp
+	return nil
+}
+
+// GetRoot returns the Merkle root.
+func (s *SparseMerkleTree) GetRoot() []byte {
+	return s.tree.Root()
+}
+
+// Prove generates a Merkle proof for a key.
+func (s *SparseMerkleTree) Prove(key []byte) (celsmt.SparseMerkleProof, error) {
+	return s.tree.Prove(key)
+}
+
+// VerifyProof verifies a proof against a root.
+func VerifyProof(proof celsmt.SparseMerkleProof, root, key, value []byte) bool {
+	return celsmt.VerifyProof(proof, root, key, value, sha256.New())
+}
+
+// ExportSnapshot returns a copy of the in-memory kv.
+func (s *SparseMerkleTree) ExportSnapshot() map[string][]byte {
+	out := make(map[string][]byte)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k, v := range s.kv {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+
+--- FILE: cmd/client/main.go ---
+package main
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/MelzLabs/DeSync/network"
+	"github.com/MelzLabs/DeSync/types"
+	"github.com/libp2p/go-libp2p/core/crypto"
+)
+
+func main() {
+	connect := flag.String("connect", "", "multiaddr to connect")
+	action := flag.String("action", "allocate", "action type (allocate, transfer, paytax, etc.)")
+	args := flag.String("args", "{}", "json args for action (map[string]string in JSON)")
+	sender := flag.String("sender", "player1", "sender id")
+	flag.Parse()
+
+	if *connect == "" {
+		log.Fatal("need --connect to at least one node")
+	}
+
+	ctx := context.Background()
+
+	// libp2p identity key
+	lp2pPriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	node, err := network.NewNodeWithKey(ctx, "/ip4/0.0.0.0/tcp/0", lp2pPriv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := node.Connect(ctx, *connect); err != nil {
+		log.Fatal(err)
+	}
+
+	// tx signing key (separate from libp2p identity)
+	_, txPriv, _ := ed25519.GenerateKey(rand.Reader)
+
+	// build payload
+	var payload map[string]string
+	_ = json.Unmarshal([]byte(*args), &payload)
+
+	tx := types.NewTxn(*sender, *action, payload)
+	tx.Nonce = uint64(time.Now().UnixNano())
+
+	if err := tx.Sign(txPriv); err != nil {
+		log.Fatal(err)
+	}
+
+	msg := network.TxMessage{Tx: tx}
+	data, _ := network.EncodeTx(msg)
+	_ = node.TxTopic.Publish(ctx, data)
+
+	fmt.Printf("Submitted tx: id=%s action=%s sender=%s payload=%v\n",
+		tx.ID, tx.Action, tx.Sender, tx.Payload)
+}
+
+
+--- FILE: cmd/inspect/main.go ---
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	blocksDir := flag.String("dir", "blocks", "blocks directory")
+	showBlock := flag.Int("block", -1, "show full block by height (default: -1 for index only)")
+	flag.Parse()
+
+	indexFile := filepath.Join(*blocksDir, "index.json")
+	data, err := os.ReadFile(indexFile)
+	if err != nil {
+		log.Fatalf("failed to read index.json: %v", err)
+	}
+
+	var index []map[string]interface{}
+	if err := json.Unmarshal(data, &index); err != nil {
+		log.Fatalf("failed to parse index.json: %v", err)
+	}
+
+	// If only index requested
+	if *showBlock == -1 {
+		fmt.Printf("=== Block Index (%d blocks) ===\n", len(index))
+		for _, entry := range index {
+			fmt.Printf("Height=%v Txs=%v File=%v Time=%v\n",
+				entry["height"], entry["txs"], entry["filename"], entry["time"])
+		}
+		return
+	}
+
+	// Show a specific block
+	filename := ""
+	for _, entry := range index {
+		if int(entry["height"].(float64)) == *showBlock {
+			filename = entry["filename"].(string)
+			break
+		}
+	}
+	if filename == "" {
+		log.Fatalf("block %d not found in index", *showBlock)
+	}
+
+	fullPath := filepath.Join(*blocksDir, filename)
+	blockData, err := os.ReadFile(fullPath)
+	if err != nil {
+		log.Fatalf("failed to read block file: %v", err)
+	}
+
+	fmt.Printf("=== Block %d ===\n", *showBlock)
+	fmt.Println(string(blockData))
+}
+
+
+--- FILE: network/keyutil.go ---
+package network
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"io/ioutil"
+	"os"
+
+	crypto "github.com/libp2p/go-libp2p/core/crypto"
+)
+
+// LoadOrCreatePrivKey loads an ed25519 key from file or generates one if missing.
+// Returns a libp2p crypto.PrivKey.
+func LoadOrCreatePrivKey(path string) (crypto.PrivKey, error) {
+	if path == "" {
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		return priv, err
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		b, err := crypto.MarshalPrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		if err := ioutil.WriteFile(path, []byte(hex.EncodeToString(b)), 0600); err != nil {
+			return nil, err
+		}
+		return priv, nil
+	}
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	b, err := hex.DecodeString(string(data))
+	if err != nil {
+		return nil, err
+	}
+	priv, err := crypto.UnmarshalPrivateKey(b)
+	if err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
+
+--- FILE: state/leveldb_store.go ---
+package state
+
+import (
+	"github.com/syndtr/goleveldb/leveldb"
+	"path/filepath"
+	"fmt"
+)
+
+type LevelDBStore struct {
+	db *leveldb.DB
+}
+
+func NewLevelDBStore(path string) (*LevelDBStore, error) {
+	p := filepath.Clean(path)
+	db, err := leveldb.OpenFile(p, nil)
+	if err != nil {
+		return nil, fmt.Errorf("open leveldb %s: %w", p, err)
+	}
+	return &LevelDBStore{db: db}, nil
+}
+
+func (l *LevelDBStore) Get(key string) ([]byte, error) {
+	b, err := l.db.Get([]byte(key), nil)
+	if err != nil {
+		if err == leveldb.ErrNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	return cp, nil
+}
+
+func (l *LevelDBStore) Set(key string, value []byte) error {
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	return l.db.Put([]byte(key), cp, nil)
+}
+
+func (l *LevelDBStore) Close() error {
+	return l.db.Close()
+}
+
+
+--- FILE: state/kv_mem.go ---
+package state
+
+// KeyValueStore defines the minimal DB interface for SMT.
+type KeyValueStore interface {
+	Get(key string) ([]byte, error)
+	Set(key string, value []byte) error
+}
+
+// memKV is an in-memory implementation of KeyValueStore (for dev + tests).
+type memKV struct {
+	m map[string][]byte
+}
+
+func NewMemKV() *memKV {
+	return &memKV{m: make(map[string][]byte)}
+}
+
+func (m *memKV) Get(k string) ([]byte, error) {
+	if v, ok := m.m[k]; ok {
+		// return a copy
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		return cp, nil
+	}
+	return nil, nil
+}
+
+func (m *memKV) Set(k string, v []byte) error {
+	cp := make([]byte, len(v))
+	copy(cp, v)
+	m.m[k] = cp
+	return nil
+}
+
+
+--- FILE: types/types.go ---
+package types
+
+import "time"
+
+// Block represents a committed block saved to disk.
+type Block struct {
+	Height  int             `json:"height"`
+	Txs     []*Transaction  `json:"txs"`
+	Root    []byte          `json:"root"`
+	Time    time.Time       `json:"time"`
+}
+
+
