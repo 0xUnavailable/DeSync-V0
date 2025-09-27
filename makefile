@@ -1,6 +1,6 @@
 # Makefile for DeSync
 
-.PHONY: all list leader worker1 worker2 worker3 workers loadgen loadgen_http inspect demo clean get-leader-id frontend
+.PHONY: all list leader worker1 worker2 worker3 workers loadgen loadgen_http inspect demo clean get-leader-id
 
 # Default
 all: leader worker1
@@ -18,7 +18,6 @@ list:
 	@echo "  inspect       - Inspect committed blocks in ./blocks"
 	@echo "  demo          - Launch leader, 3 workers, and HTTP loadgen"
 	@echo "  get-leader-id - Get the leader's peer ID from running process"
-	@echo "  frontend      - Copy/update frontend files into ./frontend"
 	@echo "  clean         - Remove blocks/ and *.key files"
 
 # Leader node (with API + monthblocks + static frontend)
@@ -193,11 +192,6 @@ demo:
 	@echo ">>> Running HTTP loadgen..."
 	go run ./cmd/loadgen_http --api=http://127.0.0.1:8080 --workers=10 --rate=1000 --txcount=100000
 	@echo ">>> Open Explorer at: http://127.0.0.1:8080/explorer.html"
-
-# Frontend build/copy (if you want to sync static assets)
-frontend:
-	@mkdir -p frontend
-	@cp -u explorer.html frontend/ || true
 
 # Clean build artifacts
 clean:
