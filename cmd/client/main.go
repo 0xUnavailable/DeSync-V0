@@ -17,7 +17,7 @@ import (
 
 func main() {
 	connect := flag.String("connect", "", "multiaddr to connect")
-	action := flag.String("action", "allocate", "action type (allocate, transfer, paytax, etc.)")
+	action := flag.String("action", "allocate", "action type (AllocateLand, Transfer, PayTax, Grow, etc.)")
 	args := flag.String("args", "{}", "json args for action (map[string]string in JSON)")
 	sender := flag.String("sender", "player1", "sender id")
 	flag.Parse()
@@ -28,7 +28,7 @@ func main() {
 
 	ctx := context.Background()
 
-	// libp2p identity key
+	// libp2p identity key (for peer connectivity only)
 	lp2pPriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
 	if err != nil {
 		log.Fatal(err)
@@ -41,24 +41,29 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// tx signing key (separate from libp2p identity)
+	// transaction signing key (separate from libp2p identity)
 	_, txPriv, _ := ed25519.GenerateKey(rand.Reader)
 
-	// build payload
+	// decode JSON args
 	var payload map[string]string
-	_ = json.Unmarshal([]byte(*args), &payload)
+	if err := json.Unmarshal([]byte(*args), &payload); err != nil {
+		log.Fatalf("invalid --args: %v", err)
+	}
 
+	// build tx
 	tx := types.NewTxn(*sender, *action, payload)
 	tx.Nonce = uint64(time.Now().UnixNano())
-
 	if err := tx.Sign(txPriv); err != nil {
 		log.Fatal(err)
 	}
 
+	// publish tx
 	msg := network.TxMessage{Tx: tx}
 	data, _ := network.EncodeTx(msg)
-	_ = node.TxTopic.Publish(ctx, data)
+	if err := node.TxTopic.Publish(ctx, data); err != nil {
+		log.Fatal(err)
+	}
 
-	fmt.Printf("Submitted tx: id=%s action=%s sender=%s payload=%v\n",
+	fmt.Printf("✅ Submitted tx: id=%s action=%s sender=%s payload=%v\n",
 		tx.ID, tx.Action, tx.Sender, tx.Payload)
 }

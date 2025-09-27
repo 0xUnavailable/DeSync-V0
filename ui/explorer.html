@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DeSync Explorer</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: #eee;
+      margin: 0;
+      padding: 0;
+    }
+    h1, h2 { margin: 10px; }
+    .section { padding: 10px; margin: 10px; background: #222; border-radius: 6px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+    th, td { border: 1px solid #444; padding: 6px; text-align: left; }
+    th { background: #333; }
+    tr:nth-child(even) { background: #1a1a1a; }
+    p { margin: 5px 0; }
+    .controls {
+      margin: 5px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .controls input {
+      padding: 4px;
+      border: 1px solid #444;
+      background: #111;
+      color: #eee;
+    }
+    .controls button {
+      padding: 4px 8px;
+      background: #333;
+      border: none;
+      color: #eee;
+      cursor: pointer;
+    }
+    .controls button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <h1>DeSync Explorer</h1>
+
+  <div class="section">
+    <h2>Status</h2>
+    <div id="status"><p>Loading...</p></div>
+  </div>
+
+  <div class="section">
+    <h2>Latest Block</h2>
+    <div class="controls">
+      <input type="text" id="search-block" placeholder="Search block txs..."
+        oninput="renderTable('block', window.latestBlockTxs, 10, this.value, 'block')">
+      <div>
+        <button id="prev-block" onclick="changePage('block', -1)">Prev</button>
+        <span id="page-block"></span>
+        <button id="next-block" onclick="changePage('block', 1)">Next</button>
+      </div>
+    </div>
+    <div id="block"><p>Loading...</p></div>
+  </div>
+
+  <div class="section">
+    <h2>All Transactions</h2>
+    <div class="controls">
+      <input type="text" id="search-txs" placeholder="Search all txs..."
+        oninput="renderTable('txs', window.allTxs, 10, this.value, 'txs')">
+      <div>
+        <button id="prev-txs" onclick="changePage('txs', -1)">Prev</button>
+        <span id="page-txs"></span>
+        <button id="next-txs" onclick="changePage('txs', 1)">Next</button>
+      </div>
+    </div>
+    <div id="txs"><p>Loading...</p></div>
+  </div>
+
+  <div class="section">
+    <h2>Tax Events (Latest Month Summary)</h2>
+    <div class="controls">
+      <input type="text" id="search-tax" placeholder="Search tax events..."
+        oninput="renderTable('tax', window.taxEvents, 10, this.value, 'tax')">
+      <div>
+        <button id="prev-tax" onclick="changePage('tax', -1)">Prev</button>
+        <span id="page-tax"></span>
+        <button id="next-tax" onclick="changePage('tax', 1)">Next</button>
+      </div>
+    </div>
+    <div id="tax"><p>Loading...</p></div>
+  </div>
+
+  <script>
+    const API = "http://localhost:8080";
+    const state = { block: { page: 1 }, txs: { page: 1 }, tax: { page: 1 } };
+
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    }
+
+    async function loadStatus() {
+      try {
+        const st = await fetchJSON(`${API}/status`);
+        document.getElementById("status").innerHTML = `
+          <p>Peer ID: ${st.peer_id}</p>
+          <p>Role: ${st.role}</p>
+          <p>Ready: ${st.ready}</p>
+          <p>Blocks: ${st.block_count}</p>
+          <p>API Version: ${st.api_version}</p>
+        `;
+      } catch (err) {
+        document.getElementById("status").innerHTML = `<p>Error: ${err}</p>`;
+      }
+    }
+
+    async function loadLatestBlock() {
+      try {
+        const block = await fetchJSON(`${API}/blocks/latest`);
+        window.latestBlockTxs = block.txs || [];
+        state.block.page = 1;
+        renderTable("block", window.latestBlockTxs, 10,
+          document.getElementById("search-block").value, "block");
+      } catch (err) {
+        document.getElementById("block").innerHTML = `<p>Error: ${err}</p>`;
+      }
+    }
+
+    async function loadAllTxs() {
+      try {
+        const txs = await fetchJSON(`${API}/txs/all`);
+        window.allTxs = txs || [];
+        state.txs.page = 1;
+        renderTable("txs", window.allTxs, 10,
+          document.getElementById("search-txs").value, "txs");
+      } catch (err) {
+        document.getElementById("txs").innerHTML = `<p>Error: ${err}</p>`;
+      }
+    }
+
+    async function loadTaxEvents() {
+      try {
+        const latest = await fetchJSON(`${API}/months/latest`);
+        window.taxEvents = Array.isArray(latest) ? latest : [latest];
+        state.tax.page = 1;
+        renderTable("tax", window.taxEvents, 10,
+          document.getElementById("search-tax").value, "tax");
+      } catch (err) {
+        document.getElementById("tax").innerHTML = `<p>Error: ${err}</p>`;
+      }
+    }
+
+    function renderTable(id, rows, limit, query = "", key) {
+      const el = document.getElementById(id);
+      if (!rows || rows.length === 0) {
+        el.innerHTML = "<p>No data</p>";
+        return;
+      }
+
+      // filter
+      let filtered = rows;
+      if (query) {
+        const q = query.toLowerCase();
+        filtered = rows.filter(r =>
+          Object.values(r).some(v => String(v).toLowerCase().includes(q))
+        );
+      }
+
+      const page = state[key].page;
+      const start = (page - 1) * limit;
+      const pageRows = filtered.slice(start, start + limit);
+
+      const keys = Object.keys(pageRows[0] || {});
+      let html = "<table><thead><tr>";
+      for (let k of keys) html += `<th>${k}</th>`;
+      html += "</tr></thead><tbody>";
+      for (let row of pageRows) {
+        html += "<tr>";
+        for (let k of keys) {
+          let v = row[k];
+          if (typeof v === "object") v = JSON.stringify(v);
+          html += `<td>${v}</td>`;
+        }
+        html += "</tr>";
+      }
+      html += "</tbody></table>";
+      el.innerHTML = html;
+
+      const totalPages = Math.ceil(filtered.length / limit) || 1;
+      document.getElementById(`page-${id}`).textContent = `Page ${page} / ${totalPages}`;
+      document.getElementById(`prev-${id}`).disabled = page <= 1;
+      document.getElementById(`next-${id}`).disabled = page >= totalPages;
+    }
+
+    function changePage(key, delta) {
+      state[key].page += delta;
+      const rows = key === "block"
+        ? window.latestBlockTxs
+        : key === "txs"
+        ? window.allTxs
+        : window.taxEvents;
+      const query = document.getElementById(`search-${key}`).value;
+      renderTable(key, rows, 10, query, key);
+    }
+
+    async function refresh() {
+      await loadStatus();
+      await loadLatestBlock();
+      await loadAllTxs();
+      await loadTaxEvents();
+    }
+
+    setInterval(refresh, 10000);
+    refresh();
+  </script>
+</body>
+</html>

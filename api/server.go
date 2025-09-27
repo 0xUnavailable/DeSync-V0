@@ -22,36 +22,44 @@ import (
 )
 
 // Server exposes read + write endpoints for the DeSync node.
-// It publishes transactions to the node's TxTopic and reads state from the provided store.
 type Server struct {
-	Node     *network.Node
-	Store    *state.MemStore
-	BlockDir string
-	Addr     string
+	Node      *network.Node
+	Store     *state.MemStore
+	BlockDir  string
+	Addr      string
+	StaticDir string
 }
 
-// NewServer creates a new API server.
-// node — network node (used to publish txs to TxTopic).
-// store — authoritative memstore used by leader.
-// blockDir — directory where leader writes block-<height>.json files.
-// addr — listen address (e.g. ":8080").
-func NewServer(node *network.Node, store *state.MemStore, blockDir, addr string) *Server {
+func NewServer(node *network.Node, store *state.MemStore, blockDir, addr, staticDir string) *Server {
 	return &Server{
-		Node:     node,
-		Store:    store,
-		BlockDir: blockDir,
-		Addr:     addr,
+		Node:      node,
+		Store:     store,
+		BlockDir:  blockDir,
+		Addr:      addr,
+		StaticDir: staticDir,
 	}
 }
 
 // Start starts the HTTP server (blocking).
 func (s *Server) Start() {
+	// API endpoints
+	http.HandleFunc("/status", s.handleStatus)
 	http.HandleFunc("/state/land/", s.handleLand)
 	http.HandleFunc("/state/player/", s.handlePlayer)
 	http.HandleFunc("/lastRoot", s.handleLastRoot)
-	http.HandleFunc("/blocks/", s.handleBlock)      // /blocks/<n>
-	http.HandleFunc("/blocks/latest", s.handleLast) // latest block
-	http.HandleFunc("/tx", s.handleTx)              // POST tx
+	http.HandleFunc("/blocks/", s.handleBlock)
+	http.HandleFunc("/blocks/latest", s.handleLast)
+	http.HandleFunc("/months/", s.handleMonthSummary)
+	http.HandleFunc("/months/latest", s.handleLatestMonth)
+	http.HandleFunc("/tx", s.handleTx)
+	http.HandleFunc("/txs/all", s.handleAllTxs)
+	http.HandleFunc("/txs/block/", s.handleBlockTxs)
+
+	// Serve static files (explorer UI)
+	if s.StaticDir != "" {
+		fs := http.FileServer(http.Dir(s.StaticDir))
+		http.Handle("/", fs)
+	}
 
 	srv := &http.Server{
 		Addr:         s.Addr,
@@ -65,9 +73,131 @@ func (s *Server) Start() {
 	}
 }
 
+// ---------------- Helpers ----------------
+
+func enableCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+func handlePreflight(w http.ResponseWriter, r *http.Request) bool {
+	enableCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
+func serveFileOr404(w http.ResponseWriter, path string) {
+	enableCORS(w)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
+}
+
+func bytesToStr(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return string(b)
+}
+
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	enableCORS(w)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func computeTxID(tx *types.Transaction) string {
+	h := sha256.New()
+	h.Write([]byte(tx.Sender))
+	h.Write([]byte(fmt.Sprintf("%d", tx.Nonce)))
+	h.Write([]byte(tx.Action))
+	if tx.Payload != nil {
+		keys := make([]string, 0, len(tx.Payload))
+		for k := range tx.Payload {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			h.Write([]byte(k))
+			h.Write([]byte(tx.Payload[k]))
+		}
+	}
+	if len(tx.PubKey) > 0 {
+		h.Write(tx.PubKey)
+	}
+	if len(tx.Sig) > 0 {
+		h.Write(tx.Sig)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // ---------------- Handlers ----------------
 
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+
+	var peerID string
+	var nodeRole string
+	var isReady bool
+
+	if s.Node != nil && s.Node.Host != nil {
+		peerID = s.Node.Host.ID().String()
+		isReady = true
+		if s.Node.TxTopic != nil {
+			nodeRole = "leader"
+		} else {
+			nodeRole = "worker"
+		}
+	} else {
+		peerID = "unknown"
+		nodeRole = "unknown"
+		isReady = false
+	}
+
+	stateSize := 0
+	if s.Store != nil {
+		snap := s.Store.GetSnapshot()
+		stateSize = len(snap)
+	}
+
+	blockCount := 0
+	if s.BlockDir != "" {
+		if entries, err := os.ReadDir(s.BlockDir); err == nil {
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), "block-") && strings.HasSuffix(e.Name(), ".json") {
+					blockCount++
+				}
+			}
+		}
+	}
+
+	resp := map[string]interface{}{
+		"peer_id":     peerID,
+		"role":        nodeRole,
+		"ready":       isReady,
+		"state_keys":  stateSize,
+		"block_count": blockCount,
+		"timestamp":   time.Now().Unix(),
+		"api_version": "1.0",
+	}
+
+	writeJSON(w, resp)
+}
+
 func (s *Server) handleLand(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
 	id := strings.TrimPrefix(r.URL.Path, "/state/land/")
 	if id == "" {
 		http.Error(w, "missing land id", http.StatusBadRequest)
@@ -89,6 +219,9 @@ func (s *Server) handleLand(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
 	id := strings.TrimPrefix(r.URL.Path, "/state/player/")
 	if id == "" {
 		http.Error(w, "missing player id", http.StatusBadRequest)
@@ -103,7 +236,9 @@ func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLastRoot(w http.ResponseWriter, r *http.Request) {
-	// placeholder: no SMT yet — return snapshot size + dummy root
+	if handlePreflight(w, r) {
+		return
+	}
 	snap := s.Store.GetSnapshot()
 	resp := map[string]interface{}{
 		"keys": len(snap),
@@ -112,22 +247,19 @@ func (s *Server) handleLastRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
-// GET /blocks/<n> where <n> is numeric (e.g. 000001) or filename suffix (e.g. 1 or 000001).
-// The caller should use the same formatting the leader saves files in (block-%06d.json).
 func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
 	trim := strings.TrimPrefix(r.URL.Path, "/blocks/")
 	if trim == "" {
 		http.Error(w, "missing block id", http.StatusBadRequest)
 		return
 	}
-	// support "latest" routed elsewhere; here we expect number
-	// try to interpret as integer first
 	if trim == "latest" {
 		s.handleLast(w, r)
 		return
 	}
-
-	// accept both plain numbers and padded numbers
 	n, err := strconv.Atoi(trim)
 	if err == nil {
 		filename := fmt.Sprintf("block-%06d.json", n)
@@ -135,19 +267,19 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		serveFileOr404(w, path)
 		return
 	}
-
-	// otherwise try exact filename
 	path := filepath.Join(s.BlockDir, fmt.Sprintf("block-%s.json", trim))
 	serveFileOr404(w, path)
 }
 
 func (s *Server) handleLast(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
 	entries, err := os.ReadDir(s.BlockDir)
 	if err != nil || len(entries) == 0 {
 		http.Error(w, "no blocks available", http.StatusNotFound)
 		return
 	}
-	// find highest block-*.json by parsing heights
 	max := -1
 	var latestName string
 	for _, e := range entries {
@@ -173,10 +305,10 @@ func (s *Server) handleLast(w http.ResponseWriter, r *http.Request) {
 	serveFileOr404(w, path)
 }
 
-// POST /tx
-// Accepts a JSON transaction (types.Transaction). If tx.ID is empty it will be computed.
-// Publishes the tx to node.TxTopic (so leader will pick it up the same as pubsub clients).
 func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -191,93 +323,163 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid transaction JSON", http.StatusBadRequest)
 		return
 	}
-
-	// compute and set ID if not present
 	if strings.TrimSpace(tx.ID) == "" {
 		tx.ID = computeTxID(&tx)
 	}
-
-	// publish to network TxTopic
 	msg := network.TxMessage{Tx: &tx}
 	data, err := network.EncodeTx(msg)
 	if err != nil {
 		http.Error(w, "failed to encode tx", http.StatusInternalServerError)
 		return
 	}
-
-	// publish using Node's TxTopic
 	if s.Node == nil || s.Node.TxTopic == nil {
 		http.Error(w, "node tx topic not available on server", http.StatusInternalServerError)
 		return
 	}
-	// use background context for publish
 	if err := s.Node.TxTopic.Publish(context.Background(), data); err != nil {
 		http.Error(w, fmt.Sprintf("failed to publish tx: %v", err), http.StatusInternalServerError)
 		return
 	}
-
 	resp := map[string]string{"status": "submitted", "txid": tx.ID}
 	writeJSON(w, resp)
 }
 
-// ---------------- Helpers ----------------
+func (s *Server) handleMonthSummary(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	nStr := strings.TrimPrefix(r.URL.Path, "/months/")
+	if nStr == "" {
+		http.Error(w, "missing month id", http.StatusBadRequest)
+		return
+	}
+	if nStr == "latest" {
+		s.handleLatestMonth(w, r)
+		return
+	}
+	n, err := strconv.Atoi(nStr)
+	if err != nil {
+		http.Error(w, "invalid month id", http.StatusBadRequest)
+		return
+	}
+	filename := fmt.Sprintf("month-summary-%06d.json", n)
+	path := filepath.Join(s.BlockDir, filename)
+	serveFileOr404(w, path)
+}
 
-func serveFileOr404(w http.ResponseWriter, path string) {
+func (s *Server) handleLatestMonth(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	entries, err := os.ReadDir(s.BlockDir)
+	if err != nil || len(entries) == 0 {
+		http.Error(w, "no month summaries available", http.StatusNotFound)
+		return
+	}
+	max := -1
+	var latestName string
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "month-summary-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		numStr := strings.TrimSuffix(strings.TrimPrefix(name, "month-summary-"), ".json")
+		n, err := strconv.Atoi(numStr)
+		if err != nil {
+			continue
+		}
+		if n > max {
+			max = n
+			latestName = name
+		}
+	}
+	if latestName == "" {
+		http.Error(w, "no month summaries found", http.StatusNotFound)
+		return
+	}
+	path := filepath.Join(s.BlockDir, latestName)
+	serveFileOr404(w, path)
+}
+
+// ---------------- Transaction History ----------------
+
+func (s *Server) handleAllTxs(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	entries, err := os.ReadDir(s.BlockDir)
+	if err != nil {
+		http.Error(w, "failed to read blocks dir", http.StatusInternalServerError)
+		return
+	}
+
+	var allTxs []map[string]interface{}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), "block-") || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(s.BlockDir, e.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var block struct {
+			Txs []types.Transaction `json:"txs"`
+		}
+		if err := json.Unmarshal(data, &block); err == nil {
+			for _, tx := range block.Txs {
+				txMap := map[string]interface{}{
+					"id":      tx.ID,
+					"sender":  tx.Sender,
+					"nonce":   tx.Nonce,
+					"action":  tx.Action,
+					"payload": tx.Payload, // will be real JSON, not [object Object]
+				}
+				allTxs = append(allTxs, txMap)
+			}
+		}
+	}
+
+	writeJSON(w, allTxs)
+}
+
+func (s *Server) handleBlockTxs(w http.ResponseWriter, r *http.Request) {
+	if handlePreflight(w, r) {
+		return
+	}
+	blockID := strings.TrimPrefix(r.URL.Path, "/txs/block/")
+	if blockID == "" {
+		http.Error(w, "missing block id", http.StatusBadRequest)
+		return
+	}
+
+	filename := fmt.Sprintf("block-%06s.json", blockID)
+	path := filepath.Join(s.BlockDir, filename)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		http.Error(w, "block not found", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(data)
-}
 
-func bytesToStr(b []byte) string {
-	if len(b) == 0 {
-		return ""
+	var block struct {
+		Txs []types.Transaction `json:"txs"`
 	}
-	return string(b)
-}
+	if err := json.Unmarshal(data, &block); err != nil {
+		http.Error(w, "invalid block json", http.StatusInternalServerError)
+		return
+	}
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-// computeTxID deterministically creates an ID for a transaction.
-// It sorts payload keys for determinism and returns the hex sha256.
-func computeTxID(tx *types.Transaction) string {
-	h := sha256.New()
-	h.Write([]byte(tx.Sender))
-	h.Write([]byte("|"))
-	h.Write([]byte(fmt.Sprintf("%d", tx.Nonce)))
-	h.Write([]byte("|"))
-	h.Write([]byte(tx.Action))
-	h.Write([]byte("|"))
-
-	// deterministic serialization of payload map
-	if tx.Payload != nil {
-		keys := make([]string, 0, len(tx.Payload))
-		for k := range tx.Payload {
-			keys = append(keys, k)
+	var txs []map[string]interface{}
+	for _, tx := range block.Txs {
+		txMap := map[string]interface{}{
+			"id":      tx.ID,
+			"sender":  tx.Sender,
+			"nonce":   tx.Nonce,
+			"action":  tx.Action,
+			"payload": tx.Payload,
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			h.Write([]byte(k))
-			h.Write([]byte("="))
-			h.Write([]byte(tx.Payload[k]))
-			h.Write([]byte(";"))
-		}
+		txs = append(txs, txMap)
 	}
 
-	// include pubkey+sig length to differentiate
-	if len(tx.PubKey) > 0 {
-		h.Write(tx.PubKey)
-	}
-	if len(tx.Sig) > 0 {
-		h.Write(tx.Sig)
-	}
-
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum)
+	writeJSON(w, txs)
 }

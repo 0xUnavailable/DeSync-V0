@@ -15,16 +15,18 @@ import (
 )
 
 var (
-	roleFlag       = flag.String("role", "worker", "node role: leader or worker")
-	idFlag         = flag.String("id", "", "node id (required)")
-	portFlag       = flag.String("port", "9000", "listen port")
-	connectFlag    = flag.String("connect", "", "multiaddr to connect (optional)")
-	keyfileFlag    = flag.String("keyfile", "", "keyfile for identity (optional)")
-	batchSizeFlag  = flag.Int("batchsize", 1000, "batch size for leader")
-	batchInterval  = flag.Duration("batchinterval", 2*time.Second, "batch flush interval")
-	blockInterval  = flag.Duration("blockinterval", 10*time.Second, "block creation interval")
-	queueInterval  = flag.Duration("queuemon", 5*time.Second, "queue monitor interval")
-	apiPortFlag    = flag.String("apiport", "8080", "port for HTTP API (leader only)")
+	roleFlag        = flag.String("role", "worker", "node role: leader or worker")
+	idFlag          = flag.String("id", "", "node id (required)")
+	portFlag        = flag.String("port", "9000", "listen port")
+	connectFlag     = flag.String("connect", "", "multiaddr to connect (optional)")
+	keyfileFlag     = flag.String("keyfile", "", "keyfile for identity (optional)")
+	batchSizeFlag   = flag.Int("batchsize", 1000, "batch size for leader")
+	batchInterval   = flag.Duration("batchinterval", 2*time.Second, "batch flush interval")
+	blockInterval   = flag.Duration("blockinterval", 10*time.Second, "block creation interval")
+	queueInterval   = flag.Duration("queuemon", 5*time.Second, "queue monitor interval")
+	apiPortFlag     = flag.String("apiport", "8080", "port for HTTP API (leader only)")
+	monthBlocksFlag = flag.Int("monthblocks", 10, "number of blocks per month (game loop)")
+	staticDirFlag   = flag.String("staticdir", "", "directory to serve static frontend files (optional)")
 )
 
 func main() {
@@ -49,7 +51,7 @@ func main() {
 	}
 	log.Printf("Node started with peer ID: %s, listening on %s", node.Host.ID().String(), addr)
 
-	// optional bootstrap
+	// optional bootstrap connect
 	if *connectFlag != "" {
 		if err := node.Connect(ctx, *connectFlag); err != nil {
 			log.Printf("Warning: failed to connect to %s: %v", *connectFlag, err)
@@ -89,17 +91,24 @@ func startLeader(ctx context.Context, node *network.Node) {
 	// run leader loops
 	go leader.RunBatchLoop(ctx, *batchSizeFlag, *batchInterval)
 	go leader.StartQueueMonitor(ctx, *queueInterval)
-	go leader.BlockTicker(ctx, *blockInterval)
+	go leader.BlockTicker(ctx, *blockInterval, *monthBlocksFlag)
 
 	// ensure block dir exists
 	blockDir := "blocks"
 	_ = os.MkdirAll(blockDir, 0755)
 
+	// static frontend dir
+	staticDir := *staticDirFlag
+	if staticDir == "" {
+		staticDir = "ui"
+	}
+
 	// start HTTP API (explorer + tx submit)
-	apiServer := api.NewServer(node, leader.State, blockDir, ":"+*apiPortFlag)
+	apiServer := api.NewServer(node, leader.State, blockDir, ":"+*apiPortFlag, staticDir)
 	go apiServer.Start()
 
-	log.Printf("Node %s started as leader with API on :%s", *idFlag, *apiPortFlag)
+	log.Printf("Node %s started as leader with API on :%s (monthblocks=%d, staticdir=%s)",
+		*idFlag, *apiPortFlag, *monthBlocksFlag, staticDir)
 }
 
 func startWorker(ctx context.Context, node *network.Node) {

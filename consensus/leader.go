@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,9 +95,7 @@ func (l *Leader) StartTxListener(ctx context.Context) error {
 			if tx == nil {
 				continue
 			}
-			if !tx.VerifySignature() {
-				continue
-			}
+			// signature check delegated to workers; leader accepts valid formatted tx
 			l.enqueueTx(tx)
 		}
 	}()
@@ -146,6 +146,7 @@ func (l *Leader) RunBatchLoop(ctx context.Context, batchSize int, interval time.
 			l.pendingBatchIDs = append(l.pendingBatchIDs, batchID)
 			l.pendingMu.Unlock()
 
+			// include authoritative snapshot
 			snapshot := l.State.GetSnapshot()
 
 			bm := network.BatchMessage{
@@ -227,8 +228,9 @@ func (l *Leader) StartQueueMonitor(ctx context.Context, interval time.Duration) 
 	}
 }
 
-// === Block ticker ===
-func (l *Leader) BlockTicker(ctx context.Context, interval time.Duration) {
+// === Block ticker and month enforcement ===
+// BlockTicker advances height, commits blocks, and runs month-end enforcement when appropriate.
+func (l *Leader) BlockTicker(ctx context.Context, interval time.Duration, monthBlockCount int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -242,18 +244,20 @@ func (l *Leader) BlockTicker(ctx context.Context, interval time.Duration) {
 		_ = json.Unmarshal(data, &index)
 	}
 
-	log.Printf("Leader %s: starting block ticker (interval=%s)", l.ID, interval)
+	log.Printf("Leader %s: starting block ticker (interval=%s monthBlocks=%d)", l.ID, interval.String(), monthBlockCount)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// advance height
 			l.blockMu.Lock()
 			l.height++
 			height := l.height
 			l.blockMu.Unlock()
 
+			// grab pending
 			l.pendingMu.Lock()
 			pendingIDs := l.pendingBatchIDs
 			batchesMap := l.pendingBatchTxs
@@ -268,36 +272,174 @@ func (l *Leader) BlockTicker(ctx context.Context, interval time.Duration) {
 				}
 			}
 
-			if len(collected) == 0 {
-				continue
+			// commit block if there are txs
+			if len(collected) > 0 {
+				blk := types.Block{
+					Height: height,
+					Txs:    collected,
+					Root:   []byte("dummy-root"),
+					Time:   time.Now(),
+				}
+
+				filename := fmt.Sprintf("block-%06d.json", blk.Height)
+				fullPath := filepath.Join(blocksDir, filename)
+				data, _ := json.MarshalIndent(blk, "", "  ")
+				if err := os.WriteFile(fullPath, data, 0644); err != nil {
+					log.Printf("Leader %s: failed to save block #%d: %v", l.ID, blk.Height, err)
+				} else {
+					// append to index
+					entry := map[string]interface{}{
+						"height":   blk.Height,
+						"filename": filename,
+						"txs":      len(collected),
+						"time":     blk.Time,
+					}
+					index = append(index, entry)
+					indexData, _ := json.MarshalIndent(index, "", "  ")
+					_ = os.WriteFile(indexFile, indexData, 0644)
+
+					log.Printf("Leader %s: committed block #%d (txs=%d)", l.ID, blk.Height, len(collected))
+				}
 			}
 
-			blk := types.Block{
-				Height: height,
-				Txs:    collected,
-				Root:   []byte("dummy-root"),
-				Time:   time.Now(),
+			// month-end check
+			if monthBlockCount > 0 && (height%monthBlockCount) == 0 {
+				monthNum := height / monthBlockCount
+				log.Printf("Leader %s: month #%d boundary reached (height=%d) — running tax enforcement", l.ID, monthNum, height)
+				if err := l.runMonthEndEnforcement(monthNum); err != nil {
+					log.Printf("Leader %s: month enforcement error: %v", l.ID, err)
+				}
 			}
-
-			filename := fmt.Sprintf("block-%06d.json", blk.Height)
-			fullPath := filepath.Join(blocksDir, filename)
-			data, _ := json.MarshalIndent(blk, "", "  ")
-			if err := os.WriteFile(fullPath, data, 0644); err != nil {
-				log.Printf("Leader %s: failed to save block #%d: %v", l.ID, blk.Height, err)
-				continue
-			}
-
-			entry := map[string]interface{}{
-				"height":   blk.Height,
-				"filename": filename,
-				"txs":      len(collected),
-				"time":     blk.Time,
-			}
-			index = append(index, entry)
-			indexData, _ := json.MarshalIndent(index, "", "  ")
-			_ = os.WriteFile(indexFile, indexData, 0644)
-
-			log.Printf("Leader %s: committed block #%d (txs=%d)", l.ID, blk.Height, len(collected))
 		}
 	}
+}
+
+// runMonthEndEnforcement iterates over land entries and enforces tax rules.
+// Writes month-summary-<n>.json into blocks/.
+func (l *Leader) runMonthEndEnforcement(month int) error {
+	// Configurable rules (tweak these)
+	const taxRate = 1.0 / 10.0   // 10%
+	const penaltyRate = 1.0 / 5.0 // 20%
+
+	// snapshot copy
+	snap := l.State.GetSnapshot()
+
+	type summaryEntry struct {
+		PlotID     string `json:"plot_id"`
+		Owner      string `json:"owner"`
+		Resource   int    `json:"resource"`
+		TaxDue     int    `json:"tax_due"`
+		TaxPaid    bool   `json:"tax_paid"`
+		Penalty    int    `json:"penalty_applied"`
+		OwnerAfter int    `json:"owner_balance_after"`
+		Note       string `json:"note,omitempty"`
+	}
+
+	summary := make([]summaryEntry, 0)
+
+	// helpers
+	readIntFromSnap := func(key string) int {
+		if v, ok := snap[key]; ok && len(v) > 0 {
+			if n, err := strconv.Atoi(string(v)); err == nil {
+				return n
+			}
+		}
+		return 0
+	}
+
+	applySet := func(k string, v []byte) {
+		l.State.Set([]byte(k), v)
+	}
+
+	// collect plot IDs by scanning snapshot keys
+	seenPlots := map[string]struct{}{}
+	for k := range snap {
+		if strings.HasPrefix(k, "land:") {
+			parts := strings.Split(k, ":")
+			if len(parts) >= 3 {
+				plotID := parts[1]
+				seenPlots[plotID] = struct{}{}
+			}
+		}
+	}
+
+	for plotID := range seenPlots {
+		ownerKey := fmt.Sprintf("land:%s:owner", plotID)
+		owner := ""
+		if b, ok := l.State.Get([]byte(ownerKey)); ok && len(b) > 0 {
+			owner = string(b)
+		}
+		resource := readIntFromSnap(fmt.Sprintf("land:%s:resource", plotID))
+		quota := readIntFromSnap(fmt.Sprintf("land:%s:quota", plotID))
+
+		var taxDue int
+		if quota > 0 {
+			taxDue = quota
+		} else {
+			taxDue = int(float64(resource) * taxRate)
+		}
+		if taxDue < 0 {
+			taxDue = 0
+		}
+
+		entry := summaryEntry{
+			PlotID:   plotID,
+			Owner:    owner,
+			Resource: resource,
+			TaxDue:   taxDue,
+		}
+
+		if owner == "" {
+			entry.Note = "unowned plot"
+			summary = append(summary, entry)
+			continue
+		}
+
+		ownerBalKey := fmt.Sprintf("player:%s:balance", owner)
+		ownerBal := 0
+		if b, ok := l.State.Get([]byte(ownerBalKey)); ok && len(b) > 0 {
+			if n, err := strconv.Atoi(string(b)); err == nil {
+				ownerBal = n
+			}
+		}
+
+		if ownerBal >= taxDue {
+			ownerBalAfter := ownerBal - taxDue
+			applySet(ownerBalKey, []byte(strconv.Itoa(ownerBalAfter)))
+			applySet(fmt.Sprintf("land:%s:tax_paid", plotID), []byte("true"))
+			entry.TaxPaid = true
+			entry.OwnerAfter = ownerBalAfter
+		} else {
+			penalty := int(float64(resource) * penaltyRate)
+			if penalty < 0 {
+				penalty = 0
+			}
+			newResource := resource - penalty
+			if newResource < 0 {
+				newResource = 0
+			}
+			applySet(fmt.Sprintf("land:%s:resource", plotID), []byte(strconv.Itoa(newResource)))
+			applySet(fmt.Sprintf("land:%s:tax_paid", plotID), []byte("false"))
+			entry.TaxPaid = false
+			entry.Penalty = penalty
+			entry.OwnerAfter = ownerBal
+			entry.Note = "insufficient balance; penalty applied"
+		}
+
+		summary = append(summary, entry)
+	}
+
+	// write summary
+	blocksDir := "blocks"
+	_ = os.MkdirAll(blocksDir, 0755)
+	filename := fmt.Sprintf("month-summary-%06d.json", month)
+	fullPath := filepath.Join(blocksDir, filename)
+	if data, err := json.MarshalIndent(summary, "", "  "); err == nil {
+		_ = os.WriteFile(fullPath, data, 0644)
+	} else {
+		log.Printf("Leader %s: failed to marshal month summary: %v", l.ID, err)
+	}
+
+	log.Printf("Leader %s: month %d enforcement complete — plots=%d", l.ID, month, len(summary))
+	return nil
 }
