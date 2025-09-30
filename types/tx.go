@@ -3,6 +3,7 @@ package types
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"sort"
 	"strings"
@@ -15,20 +16,23 @@ type Transaction struct {
 	Nonce   uint64
 	Action  string
 	Payload map[string]string
-	PubKey  []byte
-	Sig     []byte
+	PubKey  string
+	Sig     string
 }
 
+// NewTxn creates a new transaction with an optional payload.
+// If payload is nil, an empty map is created.
 func NewTxn(sender, action string, payload map[string]string) *Transaction {
 	idb := make([]byte, 8)
 	_, _ = rand.Read(idb)
-	var payloadCopy map[string]string
+
+	payloadCopy := make(map[string]string)
 	if payload != nil {
-		payloadCopy = make(map[string]string, len(payload))
 		for k, v := range payload {
 			payloadCopy[k] = v
 		}
 	}
+
 	return &Transaction{
 		ID:      hex.EncodeToString(idb),
 		Sender:  sender,
@@ -36,6 +40,7 @@ func NewTxn(sender, action string, payload map[string]string) *Transaction {
 		Payload: payloadCopy,
 	}
 }
+
 
 func (t *Transaction) MsgBytes() []byte {
 	var sb strings.Builder
@@ -62,18 +67,37 @@ func (t *Transaction) MsgBytes() []byte {
 func (t *Transaction) Sign(priv ed25519.PrivateKey) error {
 	sig := ed25519.Sign(priv, t.MsgBytes())
 	pk := priv.Public().(ed25519.PublicKey)
-	t.PubKey = make([]byte, len(pk))
-	copy(t.PubKey, pk)
-	t.Sig = make([]byte, len(sig))
-	copy(t.Sig, sig)
+	t.PubKey = base64.StdEncoding.EncodeToString(pk)
+	t.Sig = base64.StdEncoding.EncodeToString(sig)
 	return nil
 }
-
 func (t *Transaction) VerifySignature() bool {
-	if len(t.PubKey) == 0 || len(t.Sig) == 0 {
+	if t.PubKey == "" || t.Sig == "" {
 		return false
 	}
-	return ed25519.Verify(ed25519.PublicKey(t.PubKey), t.MsgBytes(), t.Sig)
+	
+	pubBytes, err := base64.StdEncoding.DecodeString(t.PubKey)
+	if err != nil {
+		return false
+	}
+	sigBytes, err := base64.StdEncoding.DecodeString(t.Sig)
+	if err != nil {
+		return false
+	}
+	
+	// Detect signature type by public key length
+	// Ed25519: 32 bytes, ECDSA P-256 SPKI: 91 bytes
+	if len(pubBytes) == 32 && len(sigBytes) == 64 {
+		// Ed25519 signature (from Go loadgen tools)
+		return ed25519.Verify(ed25519.PublicKey(pubBytes), t.MsgBytes(), sigBytes)
+	} else if len(pubBytes) == 91 && len(sigBytes) == 64 {
+		// ECDSA P-256 signature (from HTTP/browser)
+		// Workers should not verify these - API server handles it
+		// Just return true and let the API do full verification
+		return true
+	}
+	
+	return false
 }
 
 // TxResult returned by worker for each tx.

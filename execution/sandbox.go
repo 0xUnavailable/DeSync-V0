@@ -119,10 +119,13 @@ func ApplyTransaction(snap *SandboxedState, tx *types.Transaction, workerID stri
 			return res
 		}
 		key := fmt.Sprintf("land:%s:owner", plotID)
-		if _, ok := snap.Get(key); ok {
-			res.Error = "plot allocated"
+		curB, _ := snap.Get(key)
+		if curB != nil && string(curB) != "" {
+			// plot already has an owner
+			res.Error = "plot already allocated"
 			return res
 		}
+		// mark ownership and reset counters
 		res.WriteSet[key] = []byte(owner)
 		res.WriteSet[fmt.Sprintf("land:%s:quota", plotID)] = []byte("0")
 		res.WriteSet[fmt.Sprintf("land:%s:resource", plotID)] = []byte("0")
@@ -155,56 +158,42 @@ func ApplyTransaction(snap *SandboxedState, tx *types.Transaction, workerID stri
 		return res
 
 	case "Transfer":
-		from := tx.Payload["from"]
-		to := tx.Payload["to"]
-		amtStr := tx.Payload["amount"]
-		if from == "" || to == "" || amtStr == "" {
-			res.Error = "missing from/to/amount"
-			return res
-		}
-		amt, err := strconv.Atoi(amtStr)
-		if err != nil || amt <= 0 {
-			res.Error = "invalid amount"
-			return res
-		}
+    from := tx.Payload["from"]
+    to := tx.Payload["to"]
+    amtStr := tx.Payload["amount"]
+    if from == "" || to == "" || amtStr == "" {
+        res.Error = "missing from/to/amount"
+        return res
+    }
+    amt, err := strconv.Atoi(amtStr)
+    if err != nil || amt <= 0 {
+        res.Error = "invalid amount"
+        return res
+    }
 
-		fromKey := fmt.Sprintf("player:%s:balance", from)
-		toKey := fmt.Sprintf("player:%s:balance", to)
+    fromKey := fmt.Sprintf("player:%s:balance", from)
+    toKey := fmt.Sprintf("player:%s:balance", to)
 
-		// Infinite faucet shortcut: if funds come from faucet, always succeed
-		// and credit recipient (do not decrement faucet).
-		if from == "faucet" {
-			toB, _ := snap.Get(toKey)
-			toBal := 0
-			if toB != nil {
-				toBal, _ = strconv.Atoi(string(toB))
-			}
-			res.WriteSet[toKey] = []byte(strconv.Itoa(toBal + amt))
-			res.Events = append(res.Events, fmt.Sprintf("Transfer:%s->%s:%d", from, to, amt))
-			res.Success = true
-			return res
-		}
-
-		// Normal transfer flow
-		fromB, _ := snap.Get(fromKey)
-		fromBal := 0
-		if fromB != nil {
-			fromBal, _ = strconv.Atoi(string(fromB))
-		}
-		if fromBal < amt {
-			res.Error = "insufficient balance"
-			return res
-		}
-		toB, _ := snap.Get(toKey)
-		toBal := 0
-		if toB != nil {
-			toBal, _ = strconv.Atoi(string(toB))
-		}
-		res.WriteSet[fromKey] = []byte(strconv.Itoa(fromBal - amt))
-		res.WriteSet[toKey] = []byte(strconv.Itoa(toBal + amt))
-		res.Events = append(res.Events, fmt.Sprintf("Transfer:%s->%s:%d", from, to, amt))
-		res.Success = true
-		return res
+    // Normal transfer flow for all accounts
+    fromB, _ := snap.Get(fromKey)
+    fromBal := 0
+    if fromB != nil {
+        fromBal, _ = strconv.Atoi(string(fromB))
+    }
+    if fromBal < amt {
+        res.Error = "insufficient balance"
+        return res
+    }
+    toB, _ := snap.Get(toKey)
+    toBal := 0
+    if toB != nil {
+        toBal, _ = strconv.Atoi(string(toB))
+    }
+    res.WriteSet[fromKey] = []byte(strconv.Itoa(fromBal - amt))
+    res.WriteSet[toKey] = []byte(strconv.Itoa(toBal + amt))
+    res.Events = append(res.Events, fmt.Sprintf("Transfer:%s->%s:%d", from, to, amt))
+    res.Success = true
+    return res
 
 	case "PayTax":
 		plotID := tx.Payload["plotID"]
@@ -220,7 +209,7 @@ func ApplyTransaction(snap *SandboxedState, tx *types.Transaction, workerID stri
 		}
 		ownerKey := fmt.Sprintf("land:%s:owner", plotID)
 		ownerB, ok := snap.Get(ownerKey)
-		if !ok || ownerB == nil {
+		if !ok || ownerB == nil || string(ownerB) == "" {
 			res.Error = "plot not allocated"
 			return res
 		}

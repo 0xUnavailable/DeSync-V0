@@ -27,6 +27,8 @@ var (
 	apiPortFlag     = flag.String("apiport", "8080", "port for HTTP API (leader only)")
 	monthBlocksFlag = flag.Int("monthblocks", 10, "number of blocks per month (game loop)")
 	staticDirFlag   = flag.String("staticdir", "", "directory to serve static frontend files (optional)")
+	worldSizeFlag   = flag.Int("worldsize", 12, "world grid size (NxN plots) for leader to generate")
+	initWorldFlag   = flag.Bool("initworld", false, "populate world with pseudo state for testing (leader only)")
 )
 
 func main() {
@@ -60,7 +62,7 @@ func main() {
 
 	switch *roleFlag {
 	case "leader":
-		startLeader(ctx, node)
+		startLeader(ctx, node, *worldSizeFlag, *initWorldFlag)
 	case "worker":
 		startWorker(ctx, node)
 	default:
@@ -74,9 +76,15 @@ func main() {
 	log.Println("Shutting down node...")
 }
 
-func startLeader(ctx context.Context, node *network.Node) {
+func startLeader(ctx context.Context, node *network.Node, worldSize int, initWorld bool) {
 	leader := consensus.NewLeader(*idFlag)
 	leader.NetNode = node
+
+	// Initialize world grid only if flag is set
+	if initWorld {
+		leader.InitWorld(worldSize)
+		log.Printf("Leader %s: initialized world grid (%dx%d plots)", *idFlag, worldSize, worldSize)
+	}
 
 	if err := leader.StartWorkerRegistry(ctx); err != nil {
 		log.Fatalf("StartWorkerRegistry failed: %v", err)
@@ -107,8 +115,8 @@ func startLeader(ctx context.Context, node *network.Node) {
 	apiServer := api.NewServer(node, leader.State, blockDir, ":"+*apiPortFlag, staticDir)
 	go apiServer.Start()
 
-	log.Printf("Node %s started as leader with API on :%s (monthblocks=%d, staticdir=%s)",
-		*idFlag, *apiPortFlag, *monthBlocksFlag, staticDir)
+	log.Printf("Node %s started as leader with API on :%s (monthblocks=%d, staticdir=%s, initworld=%v)",
+		*idFlag, *apiPortFlag, *monthBlocksFlag, staticDir, initWorld)
 }
 
 func startWorker(ctx context.Context, node *network.Node) {

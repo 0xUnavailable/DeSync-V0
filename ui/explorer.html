@@ -13,8 +13,53 @@
     }
     h1, h2 { margin: 10px; }
     .section { padding: 10px; margin: 10px; background: #222; border-radius: 6px; }
-    table { border-collapse: collapse; width: 100%; margin-top: 10px; }
-    th, td { border: 1px solid #444; padding: 6px; text-align: left; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .metric-card {
+      background: #2a2a2a;
+      padding: 10px;
+      border-radius: 4px;
+      border-left: 3px solid #0f0;
+    }
+    .metric-card h3 {
+      margin: 0 0 5px 0;
+      font-size: 14px;
+      color: #aaa;
+    }
+    .metric-card .value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #0f0;
+    }
+    .peers-list {
+      background: #1a1a1a;
+      padding: 10px;
+      border-radius: 4px;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+    .peer-item {
+      padding: 5px;
+      margin: 3px 0;
+      background: #252525;
+      border-radius: 3px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; table-layout: fixed; }
+    th, td {
+      border: 1px solid #444;
+      padding: 6px;
+      text-align: left;
+      word-wrap: break-word;
+      word-break: break-all;
+      white-space: pre-wrap;
+      max-width: 300px;
+    }
     th { background: #333; }
     tr:nth-child(even) { background: #1a1a1a; }
     p { margin: 5px 0; }
@@ -48,7 +93,44 @@
 
   <div class="section">
     <h2>Status</h2>
+    <div class="metrics">
+      <div class="metric-card">
+        <h3>TPS (10s avg)</h3>
+        <div class="value" id="tps">0</div>
+      </div>
+      <div class="metric-card">
+        <h3>Total Blocks</h3>
+        <div class="value" id="block-count">0</div>
+      </div>
+      <div class="metric-card">
+        <h3>State Keys</h3>
+        <div class="value" id="state-keys">0</div>
+      </div>
+      <div class="metric-card">
+        <h3>Node Role</h3>
+        <div class="value" id="role" style="font-size: 18px;">-</div>
+      </div>
+    </div>
     <div id="status"><p>Loading...</p></div>
+  </div>
+
+  <div class="section">
+    <h2>Connected Peers</h2>
+    <div id="peers" class="peers-list"><p>Loading...</p></div>
+  </div>
+
+  <div class="section">
+    <h2>🌍 World State</h2>
+    <div class="controls">
+      <input type="text" id="search-world" placeholder="Search plots..."
+        oninput="renderTable('world', window.worldState, 10, this.value, 'world')">
+      <div>
+        <button id="prev-world" onclick="changePage('world', -1)">Prev</button>
+        <span id="page-world"></span>
+        <button id="next-world" onclick="changePage('world', 1)">Next</button>
+      </div>
+    </div>
+    <div id="world"><p>Loading...</p></div>
   </div>
 
   <div class="section">
@@ -95,7 +177,15 @@
 
   <script>
     const API = "http://localhost:8080";
-    const state = { block: { page: 1 }, txs: { page: 1 }, tax: { page: 1 } };
+    const state = {
+      world: { page: 1 },
+      block: { page: 1 },
+      txs: { page: 1 },
+      tax: { page: 1 }
+    };
+
+    let lastTxCount = 0;
+    let lastTimestamp = Date.now();
 
     async function fetchJSON(url) {
       const res = await fetch(url);
@@ -106,15 +196,72 @@
     async function loadStatus() {
       try {
         const st = await fetchJSON(`${API}/status`);
+        
+        // Update metrics
+        document.getElementById("block-count").textContent = st.block_count || 0;
+        document.getElementById("state-keys").textContent = st.state_keys || 0;
+        document.getElementById("role").textContent = st.role || "unknown";
+        
         document.getElementById("status").innerHTML = `
-          <p>Peer ID: ${st.peer_id}</p>
-          <p>Role: ${st.role}</p>
-          <p>Ready: ${st.ready}</p>
-          <p>Blocks: ${st.block_count}</p>
-          <p>API Version: ${st.api_version}</p>
+          <p><strong>Peer ID:</strong> ${st.peer_id}</p>
+          <p><strong>Ready:</strong> ${st.ready}</p>
+          <p><strong>API Version:</strong> ${st.api_version}</p>
         `;
       } catch (err) {
         document.getElementById("status").innerHTML = `<p>Error: ${err}</p>`;
+      }
+    }
+
+    async function loadPeers() {
+      try {
+        // Note: You'll need to add a /peers endpoint in your Go API
+        // For now, we'll show a placeholder
+        const peers = []; // await fetchJSON(`${API}/peers`);
+        
+        if (peers.length === 0) {
+          document.getElementById("peers").innerHTML = 
+            `<p style="color: #888;">Peer discovery endpoint not implemented. Add GET /peers to api/server.go</p>`;
+        } else {
+          let html = '';
+          peers.forEach(p => {
+            html += `<div class="peer-item">${p.id} - ${p.role || 'unknown'}</div>`;
+          });
+          document.getElementById("peers").innerHTML = html;
+        }
+      } catch (err) {
+        document.getElementById("peers").innerHTML = `<p>Error loading peers</p>`;
+      }
+    }
+
+    async function calculateTPS() {
+      try {
+        const txs = await fetchJSON(`${API}/txs/all`);
+        const currentTxCount = txs.length;
+        const now = Date.now();
+        
+        if (lastTxCount > 0) {
+          const txDelta = currentTxCount - lastTxCount;
+          const timeDelta = (now - lastTimestamp) / 1000; // seconds
+          const tps = txDelta / timeDelta;
+          document.getElementById("tps").textContent = tps.toFixed(2);
+        }
+        
+        lastTxCount = currentTxCount;
+        lastTimestamp = now;
+      } catch (err) {
+        document.getElementById("tps").textContent = "0";
+      }
+    }
+
+    async function loadWorldState() {
+      try {
+        const plots = await fetchJSON(`${API}/state/world`);
+        window.worldState = plots || [];
+        state.world.page = 1;
+        renderTable("world", window.worldState, 10,
+          document.getElementById("search-world").value, "world");
+      } catch (err) {
+        document.getElementById("world").innerHTML = `<p>Error: ${err}</p>`;
       }
     }
 
@@ -161,7 +308,6 @@
         return;
       }
 
-      // filter
       let filtered = rows;
       if (query) {
         const q = query.toLowerCase();
@@ -198,7 +344,9 @@
 
     function changePage(key, delta) {
       state[key].page += delta;
-      const rows = key === "block"
+      const rows = key === "world"
+        ? window.worldState
+        : key === "block"
         ? window.latestBlockTxs
         : key === "txs"
         ? window.allTxs
@@ -209,6 +357,9 @@
 
     async function refresh() {
       await loadStatus();
+      await loadPeers();
+      await calculateTPS();
+      await loadWorldState();
       await loadLatestBlock();
       await loadAllTxs();
       await loadTaxEvents();

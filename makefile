@@ -1,6 +1,6 @@
 # Makefile for DeSync
 
-.PHONY: all list leader worker1 worker2 worker3 workers loadgen loadgen_http inspect demo clean get-leader-id
+.PHONY: all list leader worker1 worker2 worker3 worker4 worker5 workers loadgen loadgen_http inspect demo clean get-leader-id
 
 # Default
 all: leader worker1
@@ -12,6 +12,8 @@ list:
 	@echo "  worker1       - Start worker1 (port 9001)"
 	@echo "  worker2       - Start worker2 (port 9002)"
 	@echo "  worker3       - Start worker3 (port 9003)"
+	@echo "  worker4       - Start worker4 (port 9004)"
+	@echo "  worker5       - Start worker5 (port 9005)"
 	@echo "  workers       - Start worker1, worker2, worker3"
 	@echo "  loadgen       - Run libp2p-based load generator (100k tx)"
 	@echo "  loadgen_http  - Run HTTP-based load generator (100k tx)"
@@ -33,7 +35,9 @@ leader:
 		--queuemon=5s \
 		--apiport=8080 \
 		--monthblocks=10 \
-		--staticdir=ui
+		--staticdir=ui \
+		--worldsize=12 \
+		--initworld=true
 
 # Helper target to get leader ID from a running leader
 get-leader-id:
@@ -128,7 +132,66 @@ worker3:
 			--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID); \
 	fi
 
-workers: worker1 worker2 worker3
+
+worker4:
+	@if [ -z "$(LEADER_ID)" ]; then \
+		echo "LEADER_ID not set. Attempting to discover..."; \
+		DISCOVERED_ID=$$(curl -s http://127.0.0.1:8080/status 2>/dev/null | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4); \
+		if [ -z "$$DISCOVERED_ID" ]; then \
+			echo "Error: Could not discover leader ID. Please:"; \
+			echo "  1. Make sure leader is running: make leader"; \
+			echo "  2. Set LEADER_ID manually: LEADER_ID=12D3KooW... make worker4"; \
+			exit 1; \
+		else \
+			echo "Discovered leader ID: $$DISCOVERED_ID"; \
+			go run ./cmd/node \
+				--role=worker \
+				--id=worker4 \
+				--port=9004 \
+				--keyfile=worker4.key \
+				--connect=/ip4/127.0.0.1/tcp/9000/p2p/$$DISCOVERED_ID; \
+		fi; \
+	else \
+		echo "Using provided LEADER_ID: $(LEADER_ID)"; \
+		go run ./cmd/node \
+			--role=worker \
+			--id=worker4 \
+			--port=9004 \
+			--keyfile=worker4.key \
+			--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID); \
+	fi
+
+
+
+worker5:
+	@if [ -z "$(LEADER_ID)" ]; then \
+		echo "LEADER_ID not set. Attempting to discover..."; \
+		DISCOVERED_ID=$$(curl -s http://127.0.0.1:8080/status 2>/dev/null | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4); \
+		if [ -z "$$DISCOVERED_ID" ]; then \
+			echo "Error: Could not discover leader ID. Please:"; \
+			echo "  1. Make sure leader is running: make leader"; \
+			echo "  2. Set LEADER_ID manually: LEADER_ID=12D3KooW... make worker5"; \
+			exit 1; \
+		else \
+			echo "Discovered leader ID: $$DISCOVERED_ID"; \
+			go run ./cmd/node \
+				--role=worker \
+				--id=worker5 \
+				--port=9005 \
+				--keyfile=worker5.key \
+				--connect=/ip4/127.0.0.1/tcp/9000/p2p/$$DISCOVERED_ID; \
+		fi; \
+	else \
+		echo "Using provided LEADER_ID: $(LEADER_ID)"; \
+		go run ./cmd/node \
+			--role=worker \
+			--id=worker5 \
+			--port=9005 \
+			--keyfile=worker5.key \
+			--connect=/ip4/127.0.0.1/tcp/9000/p2p/$(LEADER_ID); \
+	fi
+
+workers: worker1 worker2 worker3 worker4 worker5
 
 # Load generators
 loadgen:
@@ -180,7 +243,9 @@ demo:
 	  --queuemon=5s \
 	  --apiport=8080 \
 	  --monthblocks=10 \
-	  --staticdir=ui> $$LEADER_LOG 2>&1 & echo $$! > leader.pid)
+	  --staticdir=ui \
+	  --worldsize=12 \
+	  --initworld=false > $$LEADER_LOG 2>&1 & echo $$! > leader.pid)
 	@sleep 3
 	@LEADER_ID=$$(grep "peer ID" leader.log | tail -1 | awk '{print $$7}' | sed 's/,//') && \
 	echo ">>> Leader started with ID=$$LEADER_ID" && \
@@ -195,4 +260,4 @@ demo:
 
 # Clean build artifacts
 clean:
-	rm -rf blocks *.key *.log *.pid 
+	rm -rf blocks *.key *.log *.pid

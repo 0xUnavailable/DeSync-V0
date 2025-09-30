@@ -2,20 +2,23 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	mrand "math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/MelzLabs/DeSync/types"
 )
 
 // Actions for spam (no AllocateLand, seeding handles that)
@@ -26,12 +29,87 @@ var playerPlots = make(map[string][]string)
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-// sendTxn builds, signs, and POSTs a transaction
-func sendTxn(ctx context.Context, priv ed25519.PrivateKey, sender, action string, payload map[string]string, api string) string {
-	tx := types.NewTxn(sender, action, payload)
-	tx.Nonce = uint64(time.Now().UnixNano())
-	if err := tx.Sign(priv); err != nil {
+// Transaction struct matching the API
+type Transaction struct {
+	ID      string            `json:"ID"`
+	Sender  string            `json:"Sender"`
+	Nonce   uint64            `json:"Nonce"`
+	Action  string            `json:"Action"`
+	Payload map[string]string `json:"Payload"`
+	PubKey  string            `json:"PubKey"`
+	Sig     string            `json:"Sig"`
+}
+
+// canonicalize produces the same JSON format as JavaScript frontend
+func canonicalize(sender string, nonce uint64, action string, payload map[string]string) string {
+	// Sort payload keys
+	keys := make([]string, 0, len(payload))
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Build JSON with alphabetical field order: action, nonce, payload, sender
+	var parts []string
+
+	actionJSON, _ := json.Marshal(action)
+	parts = append(parts, `"action":`+string(actionJSON))
+
+	parts = append(parts, fmt.Sprintf(`"nonce":%d`, nonce))
+
+	if len(payload) > 0 {
+		var payloadParts []string
+		for _, k := range keys {
+			keyJSON, _ := json.Marshal(k)
+			valJSON, _ := json.Marshal(payload[k])
+			payloadParts = append(payloadParts, string(keyJSON)+":"+string(valJSON))
+		}
+		parts = append(parts, `"payload":{`+strings.Join(payloadParts, ",")+`}`)
+	} else {
+		parts = append(parts, `"payload":{}`)
+	}
+
+	senderJSON, _ := json.Marshal(sender)
+	parts = append(parts, `"sender":`+string(senderJSON))
+
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// sendTxn builds, signs with ECDSA P-256, and POSTs a transaction
+func sendTxn(ctx context.Context, priv *ecdsa.PrivateKey, sender, action string, payload map[string]string, api string) string {
+	nonce := uint64(time.Now().UnixNano())
+
+	// Canonicalize for signing
+	canonical := canonicalize(sender, nonce, action, payload)
+	hash := sha256.Sum256([]byte(canonical))
+
+	// Sign with ECDSA
+	r, s, err := ecdsa.Sign(rand.Reader, priv, hash[:])
+	if err != nil {
+		log.Printf("sign error: %v", err)
 		return ""
+	}
+
+	// Convert signature to P1363 format (r||s, 32 bytes each for P-256)
+	sigBytes := make([]byte, 64)
+	r.FillBytes(sigBytes[0:32])
+	s.FillBytes(sigBytes[32:64])
+
+	// Export public key as SPKI
+	pubBytes, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		log.Printf("marshal pubkey error: %v", err)
+		return ""
+	}
+
+	tx := Transaction{
+		ID:      "",
+		Sender:  sender,
+		Nonce:   nonce,
+		Action:  action,
+		Payload: payload,
+		PubKey:  base64.StdEncoding.EncodeToString(pubBytes),
+		Sig:     base64.StdEncoding.EncodeToString(sigBytes),
 	}
 
 	b, _ := json.Marshal(tx)
@@ -49,7 +127,9 @@ func sendTxn(ctx context.Context, priv ed25519.PrivateKey, sender, action string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		log.Printf("http error status=%d", resp.StatusCode)
+		body := make([]byte, 1024)
+		resp.Body.Read(body)
+		log.Printf("http error status=%d body=%s", resp.StatusCode, string(body))
 		return ""
 	}
 	return tx.ID
@@ -107,72 +187,105 @@ func main() {
 	total := int64(*txCount)
 	var sent int64
 
-	// One signing key reused for all players
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	// Generate ECDSA P-256 key
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Compute sender ID from public key (SHA256 of SPKI)
+	pubBytes, _ := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	senderHash := sha256.Sum256(pubBytes)
+	baseSender := fmt.Sprintf("%x", senderHash[:])
+
+	log.Printf("Base sender ID: %s", baseSender)
 
 	// ---------------------------------------------------
 	// SEEDING PHASE
 	// ---------------------------------------------------
 	log.Println("Seeding state (faucet -> players; AllocateLand per player)...")
 
-	faucet := "faucet"
+	// 1) Faucet -> players (use base sender as player0)
+	for w := 1; w < *workers; w++ {  // Start from 1, skip player0
+    player := fmt.Sprintf("player%d", w)
+    payload := map[string]string{
+        "from":   baseSender,  // Changed from "faucet"
+        "to":     player,
+        "amount": "10000",
+    }
+    sendTxn(ctx, priv, baseSender, "Transfer", payload, *api)
+}
 
-	// 1) Faucet -> players
-	for w := 0; w < *workers; w++ {
-		player := fmt.Sprintf("player%d", w)
+	// 2) Allocate plots (only for player 0 = our key)
+	for i := 0; i < 500000; i++ {
+		plotID := fmt.Sprintf("plot-0-%d", i)
+		playerPlots[baseSender] = append(playerPlots[baseSender], plotID)
 		payload := map[string]string{
-			"from":   faucet,
-			"to":     player,
-			"amount": "10000",
+			"plotID": plotID,
+			"owner":  baseSender,
 		}
-		sendTxn(ctx, priv, faucet, "Transfer", payload, *api)
-	}
-
-	// 2) Allocate plots
-	for w := 0; w < *workers; w++ {
-		player := fmt.Sprintf("player%d", w)
-		for i := 0; i < 5; i++ {
-			plotID := fmt.Sprintf("plot-%d-%d", w, i)
-			playerPlots[player] = append(playerPlots[player], plotID)
-			payload := map[string]string{
-				"plotID": plotID,
-				"owner":  player,
-			}
-			sendTxn(ctx, priv, player, "AllocateLand", payload, *api)
-		}
+		sendTxn(ctx, priv, baseSender, "AllocateLand", payload, *api)
 	}
 
 	log.Printf("Seeding done — waiting %s before spam", seedWait.String())
 	time.Sleep(*seedWait)
 
 	// ---------------------------------------------------
-	// SPAM PHASE
+	// SPAM PHASE (only player0 = our key can send)
 	// ---------------------------------------------------
-	log.Println("Starting spam workers now...")
+// ---------------------------------------------------
+// SPAM PHASE
+// ---------------------------------------------------
+log.Println("Starting spam workers now...")
 
-	var wg sync.WaitGroup
-	for w := 0; w < *workers; w++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			sender := fmt.Sprintf("player%d", id)
-			ticker := time.NewTicker(time.Second / time.Duration(*rate))
-			defer ticker.Stop()
+var wg sync.WaitGroup
+for w := 0; w < *workers; w++ {
+    wg.Add(1)
+    go func(id int) {
+        defer wg.Done()
+        ticker := time.NewTicker(time.Second / time.Duration(*rate))
+        defer ticker.Stop()
 
-			for range ticker.C {
-				if total > 0 && atomic.LoadInt64(&sent) >= total {
-					return
-				}
-				action := actions[mrand.Intn(len(actions))]
-				payload := randomPayload(action, sender, *workers)
-				if payload == nil {
-					continue
-				}
-				sendTxn(ctx, priv, sender, action, payload, *api)
-				atomic.AddInt64(&sent, 1)
-			}
-		}(w)
-	}
+        for range ticker.C {
+            if total > 0 && atomic.LoadInt64(&sent) >= total {
+                return
+            }
+            
+            // Only use actions that work with single account
+            validActions := []string{"Grow", "PayTax"}
+            action := validActions[mrand.Intn(len(validActions))]
+            
+            var payload map[string]string
+            switch action {
+            case "Grow":
+                plots := playerPlots[baseSender]
+                if len(plots) == 0 {
+                    continue
+                }
+                plotID := plots[mrand.Intn(len(plots))]
+                payload = map[string]string{
+                    "plotID": plotID,
+                    "amount": fmt.Sprintf("%d", mrand.Intn(10)+1),
+                }
+            case "PayTax":
+                plots := playerPlots[baseSender]
+                if len(plots) == 0 {
+                    continue
+                }
+                plotID := plots[mrand.Intn(len(plots))]
+                payload = map[string]string{
+                    "plotID": plotID,
+                    "amount": fmt.Sprintf("%d", mrand.Intn(5)+1),
+                }
+            }
+            
+            if payload != nil {
+                sendTxn(ctx, priv, baseSender, action, payload, *api)
+                atomic.AddInt64(&sent, 1)
+            }
+        }
+    }(w)
+}
 
 	if total > 0 {
 		for {

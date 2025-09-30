@@ -51,6 +51,38 @@ func NewLeader(id string) *Leader {
 	}
 }
 
+// InitWorld seeds the in-memory state with a size x size grid of plots.
+// It is idempotent: it will not overwrite existing owner/resource/quota keys.
+func (l *Leader) InitWorld(size int) {
+	if size <= 0 {
+		return
+	}
+	
+	// Initialize genesis account - use the hash from your loadgen output
+	genesisAccount := "842b4e0a5f891d7ddd612bbed4e006b30029777618089e11e4434b23aa8f436e"
+	genesisKey := fmt.Sprintf("player:%s:balance", genesisAccount)
+	l.State.Set([]byte(genesisKey), []byte("1000000000000000000000"))
+	log.Printf("Leader: initialized genesis account %s with 10000M balance", genesisAccount)
+	
+	for x := 0; x < size; x++ {
+		for y := 0; y < size; y++ {
+			plotID := fmt.Sprintf("plot-%d-%d", x, y)
+			ownerKey := fmt.Sprintf("land:%s:owner", plotID)
+			if b, ok := l.State.Get([]byte(ownerKey)); !ok || len(b) == 0 {
+				l.State.Set([]byte(ownerKey), []byte(""))
+			}
+			quotaKey := fmt.Sprintf("land:%s:quota", plotID)
+			if b, ok := l.State.Get([]byte(quotaKey)); !ok || len(b) == 0 {
+				l.State.Set([]byte(quotaKey), []byte("0"))
+			}
+			resKey := fmt.Sprintf("land:%s:resource", plotID)
+			if b, ok := l.State.Get([]byte(resKey)); !ok || len(b) == 0 {
+				l.State.Set([]byte(resKey), []byte("0"))
+			}
+		}
+	}
+	log.Printf("Leader %s: initialized world grid %dx%d", l.ID, size, size)
+}
 // === Worker registry ===
 func (l *Leader) StartWorkerRegistry(ctx context.Context) error {
 	sub, err := l.NetNode.WorkersTopic.Subscribe()
@@ -430,16 +462,19 @@ func (l *Leader) runMonthEndEnforcement(month int) error {
 	}
 
 	// write summary
-	blocksDir := "blocks"
-	_ = os.MkdirAll(blocksDir, 0755)
-	filename := fmt.Sprintf("month-summary-%06d.json", month)
-	fullPath := filepath.Join(blocksDir, filename)
-	if data, err := json.MarshalIndent(summary, "", "  "); err == nil {
-		_ = os.WriteFile(fullPath, data, 0644)
-	} else {
-		log.Printf("Leader %s: failed to marshal month summary: %v", l.ID, err)
-	}
-
-	log.Printf("Leader %s: month %d enforcement complete — plots=%d", l.ID, month, len(summary))
-	return nil
+		if len(summary) > 0 {
+			blocksDir := "blocks"
+			_ = os.MkdirAll(blocksDir, 0755)
+			filename := fmt.Sprintf("month-summary-%06d.json", month)
+			fullPath := filepath.Join(blocksDir, filename)
+			if data, err := json.MarshalIndent(summary, "", "  "); err == nil {
+				_ = os.WriteFile(fullPath, data, 0644)
+			} else {
+				log.Printf("Leader %s: failed to marshal month summary: %v", l.ID, err)
+			}
+			log.Printf("Leader %s: month %d enforcement complete — plots=%d", l.ID, month, len(summary))
+		} else {
+			log.Printf("Leader %s: month %d enforcement skipped (no activity)", l.ID, month)
+		}
+		return nil
 }

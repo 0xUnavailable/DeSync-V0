@@ -80,7 +80,7 @@ func main() {
 				return nil // Skip bundle.go and desync_test.go
 			}
 			ext := filepath.Ext(path)
-			if ext == ".go" {
+			if ext == ".go" || ext == ".html" {
 				relPath, _ := filepath.Rel(*root, path)
 				info := readFileInfo(path, relPath)
 				if info.RelPath != "" { // Valid file was read

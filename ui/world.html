@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DeSync MVP</title>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+  <style>
+    body {
+      font-family: 'Press Start 2P', monospace;
+      background: repeating-linear-gradient(
+        45deg,
+        #2a2a2a,
+        #2a2a2a 20px,
+        #1e1e1e 20px,
+        #1e1e1e 40px
+      );
+      color: #e0e0e0;
+      padding: 2rem;
+    }
+    h1 { color: #00ff66; text-shadow: 2px 2px #000; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .card {
+      background: #3c3c3c;
+      border: 4px solid #111;
+      padding: 1rem;
+      border-radius: 0;
+      box-shadow: inset -4px -4px #1a1a1a, inset 4px 4px #555;
+    }
+    label { display: block; margin-top: 0.5rem; font-size: 12px; }
+    input, textarea, select {
+      font-family: 'Press Start 2P', monospace;
+      background: #1a1a1a;
+      color: #00ff66;
+      border: 2px solid #444;
+      padding: 0.5rem;
+      width: 100%;
+      font-size: 12px;
+      resize: none;
+    }
+    button {
+      margin-top: 1rem;
+      font-family: 'Press Start 2P', monospace;
+      padding: 0.7rem 1rem;
+      border: 3px solid #111;
+      background: #00ff66;
+      color: #111;
+      text-transform: uppercase;
+      cursor: pointer;
+      box-shadow: 3px 3px #000;
+    }
+    button:active { box-shadow: none; transform: translate(3px, 3px); }
+    pre {
+      background: #111;
+      color: #00ff66;
+      padding: 1rem;
+      font-size: 10px;
+      overflow-x: auto;
+      border: 2px solid #333;
+    }
+  </style>
+</head>
+<body>
+  <h1>⛏️ DeSync World MVP</h1>
+
+  <div class="card">
+    <h3>🪪 Identity</h3>
+    <p><strong>Sender ID:</strong> <span id="sender-id">loading...</span></p>
+    <button onclick="regenerateKey()">🔑 New Key</button>
+  </div>
+
+  <div class="card">
+    <h3>📜 Create Transaction</h3>
+    <label>Action</label>
+    <select id="action" onchange="setPayloadExample()">
+      <option value="Grow">Grow</option>
+      <option value="Transfer">Transfer</option>
+      <option value="PayTax">PayTax</option>
+      <option value="AllocateLand">AllocateLand</option>
+    </select>
+    <label>Payload (JSON)</label>
+    <textarea id="payload" rows="4">{ "to":"player1", "amount":"5" }</textarea>
+    <button onclick="submitTx()">🚀 Send</button>
+  </div>
+
+  <div class="card">
+    <h3>📡 Response</h3>
+    <pre id="response">No tx yet.</pre>
+  </div>
+
+<script>
+// === Signing Utils ===
+function bufToBase64(b){ return btoa(String.fromCharCode(...new Uint8Array(b))); }
+function base64ToBuf(s){ const bin=atob(s); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i); return arr.buffer; }
+async function sha256Bytes(b){ const h=await crypto.subtle.digest('SHA-256',b); return new Uint8Array(h); }
+function hexEncodeBytes(b){ const a=(b instanceof Uint8Array)?b:new Uint8Array(b); return Array.from(a).map(x=>x.toString(16).padStart(2,'0')).join(''); }
+function canonicalize(obj){ if(obj===null||typeof obj!=='object')return JSON.stringify(obj);
+  if(Array.isArray(obj))return '['+obj.map(canonicalize).join(',')+']';
+  const keys=Object.keys(obj).sort();const parts=[];
+  for(const k of keys){ parts.push(JSON.stringify(k)+':'+canonicalize(obj[k])); }
+  return '{'+parts.join(',')+'}'; }
+const KEY_LS='desync_keypair';
+
+async function generateKeypairAndStore(){
+  const kp=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},true,['sign','verify']);
+  const spki=await crypto.subtle.exportKey('spki',kp.publicKey);
+  const jwk=await crypto.subtle.exportKey('jwk',kp.privateKey);
+  localStorage.setItem(KEY_LS,JSON.stringify({spki:bufToBase64(spki),priv:jwk}));
+}
+async function loadKeypair(){
+  const raw=localStorage.getItem(KEY_LS); if(!raw)return null;
+  const parsed=JSON.parse(raw);
+  const priv=await crypto.subtle.importKey('jwk',parsed.priv,{name:'ECDSA',namedCurve:'P-256'},true,['sign']);
+  const pub=await crypto.subtle.importKey('spki',base64ToBuf(parsed.spki),{name:'ECDSA',namedCurve:'P-256'},true,['verify']);
+  return {spki:parsed.spki,priv,pub};
+}
+async function getSenderID(){
+  const kp=await loadKeypair(); if(!kp)return null;
+  const h=await sha256Bytes(base64ToBuf(kp.spki)); return hexEncodeBytes(h);
+}
+async function signTx(tx){
+  const kp=await loadKeypair();
+  const str=canonicalize({sender:tx.sender,nonce:tx.nonce,action:tx.action,payload:tx.payload||{}});
+  const data=new TextEncoder().encode(str);
+  const sig=await crypto.subtle.sign({name:'ECDSA',hash:{name:'SHA-256'}},kp.priv,data);
+  return {sig:bufToBase64(sig),pub:kp.spki};
+}
+
+// === UI ===
+async function refreshSender(){ 
+  let id=await getSenderID(); 
+  if(!id){ 
+    await generateKeypairAndStore(); 
+    id=await getSenderID(); 
+  }
+  document.getElementById('sender-id').innerText=id;
+  setPayloadExample(); // Set default payload after sender is loaded
+}
+
+function setPayloadExample(){
+  const action=document.getElementById('action').value;
+  const sender=document.getElementById('sender-id').innerText;
+  
+  if(action==='Grow') {
+    document.getElementById('payload').value='{ "plotID":"plot-0-0", "amount":"5" }';
+  }
+  if(action==='Transfer') {
+    document.getElementById('payload').value='{ "from":"' + sender + '", "to":"player1", "amount":"10" }';
+  }
+  if(action==='PayTax') {
+    document.getElementById('payload').value='{ "plotID":"plot-0-0", "amount":"2" }';
+  }
+  if(action==='AllocateLand') {
+    document.getElementById('payload').value='{ "plotID":"plot-0-1", "owner":"' + sender + '" }';
+  }
+}
+
+async function submitTx(){
+  try{
+    const sender=await getSenderID();
+    const action=document.getElementById('action').value;
+    const payload=JSON.parse(document.getElementById('payload').value);
+    const tx={sender,nonce:Date.now(),action,payload};
+    
+    console.log('TX before signing:', JSON.stringify(tx));
+    
+    const sig=await signTx(tx);
+    const body={ID:"",Sender:tx.sender,Nonce:tx.nonce,Action:tx.action,Payload:tx.payload,PubKey:sig.pub,Sig:sig.sig};
+    
+    console.log('Body being sent:', JSON.stringify(body));
+    
+    const res=await fetch("/tx",{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const out=await res.text();
+    document.getElementById('response').innerText=out;
+  }catch(e){ document.getElementById('response').innerText="Error: "+e; }
+}
+refreshSender();
+</script>
+</body>
+</html>
