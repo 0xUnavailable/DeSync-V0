@@ -16,6 +16,16 @@ func NewMemStore() *MemStore {
 	}
 }
 
+// Add to state/memstore.go
+func (m *MemStore) SetBatch(updates map[string][]byte) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    for k, v := range updates {
+        m.data[k] = v
+    }
+}
+
+
 func (m *MemStore) Get(key []byte) ([]byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -29,7 +39,6 @@ func (m *MemStore) Set(key []byte, val []byte) {
 	m.data[string(key)] = val
 }
 
-// ✅ Add this
 // GetSnapshot returns a full copy of the current state as a map.
 func (m *MemStore) GetSnapshot() map[string][]byte {
 	m.mu.RLock()

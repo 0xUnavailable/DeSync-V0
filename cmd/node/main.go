@@ -20,8 +20,8 @@ var (
 	portFlag        = flag.String("port", "9000", "listen port")
 	connectFlag     = flag.String("connect", "", "multiaddr to connect (optional)")
 	keyfileFlag     = flag.String("keyfile", "", "keyfile for identity (optional)")
-	batchSizeFlag   = flag.Int("batchsize", 1000, "batch size for leader")
-	batchInterval   = flag.Duration("batchinterval", 2*time.Second, "batch flush interval")
+	batchSizeFlag   = flag.Int("batchsize", 5000, "batch size for leader (increased from 1000)")
+	batchInterval   = flag.Duration("batchinterval", 500*time.Millisecond, "batch flush interval (decreased from 2s)")
 	blockInterval   = flag.Duration("blockinterval", 10*time.Second, "block creation interval")
 	queueInterval   = flag.Duration("queuemon", 5*time.Second, "queue monitor interval")
 	apiPortFlag     = flag.String("apiport", "8080", "port for HTTP API (leader only)")
@@ -100,6 +100,7 @@ func startLeader(ctx context.Context, node *network.Node, worldSize int, initWor
 	go leader.RunBatchLoop(ctx, *batchSizeFlag, *batchInterval)
 	go leader.StartQueueMonitor(ctx, *queueInterval)
 	go leader.BlockTicker(ctx, *blockInterval, *monthBlocksFlag)
+	go leader.StartTPSMonitor(ctx, 10*time.Second) // Log TPS every 10 seconds
 
 	// ensure block dir exists
 	blockDir := "blocks"

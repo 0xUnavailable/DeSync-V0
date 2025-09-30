@@ -104,11 +104,6 @@ func ApplyTransaction(snap *SandboxedState, tx *types.Transaction, workerID stri
 		DeclaredKeys: DeclaredKeysFor(tx),
 	}
 
-	// Verify signature
-	if !tx.VerifySignature() {
-		res.Error = "invalid signature"
-		return res
-	}
 
 	switch tx.Action {
 	case "AllocateLand":

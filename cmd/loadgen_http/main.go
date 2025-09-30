@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -24,10 +25,21 @@ import (
 // Actions for spam (no AllocateLand, seeding handles that)
 var actions = []string{"Grow", "Transfer", "PayTax"}
 
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
+
 // Tracks plots owned per player
 var playerPlots = make(map[string][]string)
-
-var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // Transaction struct matching the API
 type Transaction struct {
@@ -135,38 +147,6 @@ func sendTxn(ctx context.Context, priv *ecdsa.PrivateKey, sender, action string,
 	return tx.ID
 }
 
-// randomPayload chooses valid payloads constrained to seeded state
-func randomPayload(action string, sender string, workers int) map[string]string {
-	args := map[string]string{}
-	switch action {
-	case "Grow":
-		plots := playerPlots[sender]
-		if len(plots) == 0 {
-			return nil
-		}
-		plotID := plots[mrand.Intn(len(plots))]
-		args["plotID"] = plotID
-		args["amount"] = fmt.Sprintf("%d", mrand.Intn(10)+1)
-	case "Transfer":
-		to := sender
-		for to == sender {
-			to = fmt.Sprintf("player%d", mrand.Intn(workers))
-		}
-		args["from"] = sender
-		args["to"] = to
-		args["amount"] = fmt.Sprintf("%d", mrand.Intn(25)+1)
-	case "PayTax":
-		plots := playerPlots[sender]
-		if len(plots) == 0 {
-			return nil
-		}
-		plotID := plots[mrand.Intn(len(plots))]
-		args["plotID"] = plotID
-		args["amount"] = fmt.Sprintf("%d", mrand.Intn(10)+1)
-	}
-	return args
-}
-
 func main() {
 	api := flag.String("api", "http://127.0.0.1:8080", "HTTP API base URL")
 	workers := flag.Int("workers", 5, "number of tx senders")
@@ -186,6 +166,7 @@ func main() {
 
 	total := int64(*txCount)
 	var sent int64
+	var wg sync.WaitGroup
 
 	// Generate ECDSA P-256 key
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -206,15 +187,15 @@ func main() {
 	log.Println("Seeding state (faucet -> players; AllocateLand per player)...")
 
 	// 1) Faucet -> players (use base sender as player0)
-	for w := 1; w < *workers; w++ {  // Start from 1, skip player0
-    player := fmt.Sprintf("player%d", w)
-    payload := map[string]string{
-        "from":   baseSender,  // Changed from "faucet"
-        "to":     player,
-        "amount": "10000",
-    }
-    sendTxn(ctx, priv, baseSender, "Transfer", payload, *api)
-}
+	for w := 1; w < *workers; w++ { // Start from 1, skip player0
+		player := fmt.Sprintf("player%d", w)
+		payload := map[string]string{
+			"from":   baseSender, // Changed from "faucet"
+			"to":     player,
+			"amount": "10000",
+		}
+		sendTxn(ctx, priv, baseSender, "Transfer", payload, *api)
+	}
 
 	// 2) Allocate plots (only for player 0 = our key)
 	for i := 0; i < 500000; i++ {
@@ -231,71 +212,103 @@ func main() {
 	time.Sleep(*seedWait)
 
 	// ---------------------------------------------------
-	// SPAM PHASE (only player0 = our key can send)
+	// SPAM PHASE with parallel HTTP
 	// ---------------------------------------------------
-// ---------------------------------------------------
-// SPAM PHASE
-// ---------------------------------------------------
-log.Println("Starting spam workers now...")
+	log.Println("Starting spam workers with parallel HTTP...")
 
-var wg sync.WaitGroup
-for w := 0; w < *workers; w++ {
-    wg.Add(1)
-    go func(id int) {
-        defer wg.Done()
-        ticker := time.NewTicker(time.Second / time.Duration(*rate))
-        defer ticker.Stop()
+	// Create channels for parallel tx sending
+	type txJob struct {
+		action  string
+		payload map[string]string
+	}
 
-        for range ticker.C {
-            if total > 0 && atomic.LoadInt64(&sent) >= total {
-                return
-            }
-            
-            // Only use actions that work with single account
-            validActions := []string{"Grow", "PayTax"}
-            action := validActions[mrand.Intn(len(validActions))]
-            
-            var payload map[string]string
-            switch action {
-            case "Grow":
-                plots := playerPlots[baseSender]
-                if len(plots) == 0 {
-                    continue
-                }
-                plotID := plots[mrand.Intn(len(plots))]
-                payload = map[string]string{
-                    "plotID": plotID,
-                    "amount": fmt.Sprintf("%d", mrand.Intn(10)+1),
-                }
-            case "PayTax":
-                plots := playerPlots[baseSender]
-                if len(plots) == 0 {
-                    continue
-                }
-                plotID := plots[mrand.Intn(len(plots))]
-                payload = map[string]string{
-                    "plotID": plotID,
-                    "amount": fmt.Sprintf("%d", mrand.Intn(5)+1),
-                }
-            }
-            
-            if payload != nil {
-                sendTxn(ctx, priv, baseSender, action, payload, *api)
-                atomic.AddInt64(&sent, 1)
-            }
-        }
-    }(w)
-}
+	txChan := make(chan txJob, *rate**workers*2) // Buffer for smoother flow
 
+	// Start HTTP sender pool (10 parallel senders per worker)
+	sendersPerWorker := 10
+	for w := 0; w < *workers; w++ {
+		for s := 0; s < sendersPerWorker; s++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				for job := range txChan {
+					if total > 0 && atomic.LoadInt64(&sent) >= total {
+						return
+					}
+					sendTxn(ctx, priv, baseSender, job.action, job.payload, *api)
+					atomic.AddInt64(&sent, 1)
+				}
+			}(w)
+		}
+	}
+
+	// Start transaction generators (one per worker)
+	for w := 0; w < *workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ticker := time.NewTicker(time.Second / time.Duration(*rate))
+			defer ticker.Stop()
+
+			for range ticker.C {
+				if total > 0 && atomic.LoadInt64(&sent) >= total {
+					return
+				}
+
+				// Generate transaction
+				validActions := []string{"Grow", "PayTax"}
+				action := validActions[mrand.Intn(len(validActions))]
+
+				var payload map[string]string
+				switch action {
+				case "Grow":
+					plots := playerPlots[baseSender]
+					if len(plots) == 0 {
+						continue
+					}
+					plotID := plots[mrand.Intn(len(plots))]
+					payload = map[string]string{
+						"plotID": plotID,
+						"amount": fmt.Sprintf("%d", mrand.Intn(10)+1),
+					}
+				case "PayTax":
+					plots := playerPlots[baseSender]
+					if len(plots) == 0 {
+						continue
+					}
+					plotID := plots[mrand.Intn(len(plots))]
+					payload = map[string]string{
+						"plotID": plotID,
+						"amount": fmt.Sprintf("%d", mrand.Intn(5)+1),
+					}
+				}
+
+				if payload != nil {
+					// Non-blocking send to channel
+					select {
+					case txChan <- txJob{action: action, payload: payload}:
+					default:
+						// Channel full, skip this tx
+					}
+				}
+			}
+		}(w)
+	}
+
+	// Wait for completion or target
 	if total > 0 {
 		for {
 			if atomic.LoadInt64(&sent) >= total {
 				log.Printf("Loadgen finished: sent %d transactions", total)
+				close(txChan) // Signal senders to stop
 				break
 			}
 			time.Sleep(1 * time.Second)
 		}
 	} else {
-		wg.Wait()
+		// Run forever
+		select {}
 	}
+
+	wg.Wait()
 }

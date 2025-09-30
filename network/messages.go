@@ -61,7 +61,6 @@ func DecodeTx(data []byte) (*TxMessage, error) {
 }
 
 // === Batch message ===
-// ✅ Added Snapshot so leader can send state to workers
 type BatchMessage struct {
 	BatchID      string
 	Txs          []*types.Transaction

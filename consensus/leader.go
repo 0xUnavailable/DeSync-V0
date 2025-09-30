@@ -38,9 +38,15 @@ type Leader struct {
 	// simple block height
 	blockMu sync.Mutex
 	height  int
-}
 
+	// TPS tracking - fixed window approach
+	tpsMu           sync.Mutex
+	tpsLastLog      time.Time
+	tpsTotalTxs     int64
+	tpsLastTotalTxs int64
+}
 func NewLeader(id string) *Leader {
+	now := time.Now()
 	return &Leader{
 		ID:                  id,
 		State:               state.NewMemStore(),
@@ -48,6 +54,36 @@ func NewLeader(id string) *Leader {
 		pendingBatchTxs:     make(map[string][]*types.Transaction),
 		pendingBatchIDs:     make([]string, 0),
 		nextBatchSequential: 0,
+		tpsLastLog:          now,
+		tpsTotalTxs:         0,
+		tpsLastTotalTxs:     0,
+	}
+}
+
+func (l *Leader) StartTPSMonitor(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.tpsMu.Lock()
+			now := time.Now()
+			elapsed := now.Sub(l.tpsLastLog).Seconds()
+			txDelta := l.tpsTotalTxs - l.tpsLastTotalTxs
+			
+			if elapsed > 0 && txDelta > 0 {
+				tps := float64(txDelta) / elapsed
+				log.Printf("🔥 Leader %s: TPS=%.2f | processed=%d txs in %.1fs | total=%d", 
+					l.ID, tps, txDelta, elapsed, l.tpsTotalTxs)
+			}
+			
+			l.tpsLastLog = now
+			l.tpsLastTotalTxs = l.tpsTotalTxs
+			l.tpsMu.Unlock()
+		}
 	}
 }
 
@@ -217,21 +253,34 @@ func (l *Leader) ListenResults(ctx context.Context) error {
 				continue
 			}
 
+			// Collect all writes first
+			writeBuffer := make(map[string][]byte)
 			applied := 0
 			failed := 0
+			
 			for _, r := range sr.Results {
 				if r == nil {
 					continue
 				}
 				if r.Success {
 					for k, v := range r.WriteSet {
-						l.State.Set([]byte(k), v)
+						writeBuffer[k] = v
 						applied++
 					}
 				} else {
 					failed++
 				}
 			}
+
+			// Apply all writes in ONE batch operation
+			if len(writeBuffer) > 0 {
+				l.State.SetBatch(writeBuffer)
+			}
+
+			// Increment total processed count
+			l.tpsMu.Lock()
+			l.tpsTotalTxs += int64(len(sr.Results))
+			l.tpsMu.Unlock()
 
 			log.Printf("Leader %s: results from worker=%s batch=%s applied_writes=%d failures=%d",
 				l.ID, sr.WorkerID, sr.BatchID, applied, failed)
@@ -240,7 +289,6 @@ func (l *Leader) ListenResults(ctx context.Context) error {
 
 	return nil
 }
-
 // === Queue monitor ===
 func (l *Leader) StartQueueMonitor(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)

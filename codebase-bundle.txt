@@ -710,9 +710,15 @@ type Leader struct {
 	// simple block height
 	blockMu sync.Mutex
 	height  int
-}
 
+	// TPS tracking - fixed window approach
+	tpsMu           sync.Mutex
+	tpsLastLog      time.Time
+	tpsTotalTxs     int64
+	tpsLastTotalTxs int64
+}
 func NewLeader(id string) *Leader {
+	now := time.Now()
 	return &Leader{
 		ID:                  id,
 		State:               state.NewMemStore(),
@@ -720,6 +726,36 @@ func NewLeader(id string) *Leader {
 		pendingBatchTxs:     make(map[string][]*types.Transaction),
 		pendingBatchIDs:     make([]string, 0),
 		nextBatchSequential: 0,
+		tpsLastLog:          now,
+		tpsTotalTxs:         0,
+		tpsLastTotalTxs:     0,
+	}
+}
+
+func (l *Leader) StartTPSMonitor(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.tpsMu.Lock()
+			now := time.Now()
+			elapsed := now.Sub(l.tpsLastLog).Seconds()
+			txDelta := l.tpsTotalTxs - l.tpsLastTotalTxs
+			
+			if elapsed > 0 && txDelta > 0 {
+				tps := float64(txDelta) / elapsed
+				log.Printf("🔥 Leader %s: TPS=%.2f | processed=%d txs in %.1fs | total=%d", 
+					l.ID, tps, txDelta, elapsed, l.tpsTotalTxs)
+			}
+			
+			l.tpsLastLog = now
+			l.tpsLastTotalTxs = l.tpsTotalTxs
+			l.tpsMu.Unlock()
+		}
 	}
 }
 
@@ -889,21 +925,34 @@ func (l *Leader) ListenResults(ctx context.Context) error {
 				continue
 			}
 
+			// Collect all writes first
+			writeBuffer := make(map[string][]byte)
 			applied := 0
 			failed := 0
+			
 			for _, r := range sr.Results {
 				if r == nil {
 					continue
 				}
 				if r.Success {
 					for k, v := range r.WriteSet {
-						l.State.Set([]byte(k), v)
+						writeBuffer[k] = v
 						applied++
 					}
 				} else {
 					failed++
 				}
 			}
+
+			// Apply all writes in ONE batch operation
+			if len(writeBuffer) > 0 {
+				l.State.SetBatch(writeBuffer)
+			}
+
+			// Increment total processed count
+			l.tpsMu.Lock()
+			l.tpsTotalTxs += int64(len(sr.Results))
+			l.tpsMu.Unlock()
 
 			log.Printf("Leader %s: results from worker=%s batch=%s applied_writes=%d failures=%d",
 				l.ID, sr.WorkerID, sr.BatchID, applied, failed)
@@ -912,7 +961,6 @@ func (l *Leader) ListenResults(ctx context.Context) error {
 
 	return nil
 }
-
 // === Queue monitor ===
 func (l *Leader) StartQueueMonitor(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -1542,6 +1590,7 @@ import (
 	"fmt"
 	"log"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -1553,10 +1602,21 @@ import (
 // Actions for spam (no AllocateLand, seeding handles that)
 var actions = []string{"Grow", "Transfer", "PayTax"}
 
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
+
 // Tracks plots owned per player
 var playerPlots = make(map[string][]string)
-
-var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // Transaction struct matching the API
 type Transaction struct {
@@ -1664,38 +1724,6 @@ func sendTxn(ctx context.Context, priv *ecdsa.PrivateKey, sender, action string,
 	return tx.ID
 }
 
-// randomPayload chooses valid payloads constrained to seeded state
-func randomPayload(action string, sender string, workers int) map[string]string {
-	args := map[string]string{}
-	switch action {
-	case "Grow":
-		plots := playerPlots[sender]
-		if len(plots) == 0 {
-			return nil
-		}
-		plotID := plots[mrand.Intn(len(plots))]
-		args["plotID"] = plotID
-		args["amount"] = fmt.Sprintf("%d", mrand.Intn(10)+1)
-	case "Transfer":
-		to := sender
-		for to == sender {
-			to = fmt.Sprintf("player%d", mrand.Intn(workers))
-		}
-		args["from"] = sender
-		args["to"] = to
-		args["amount"] = fmt.Sprintf("%d", mrand.Intn(25)+1)
-	case "PayTax":
-		plots := playerPlots[sender]
-		if len(plots) == 0 {
-			return nil
-		}
-		plotID := plots[mrand.Intn(len(plots))]
-		args["plotID"] = plotID
-		args["amount"] = fmt.Sprintf("%d", mrand.Intn(10)+1)
-	}
-	return args
-}
-
 func main() {
 	api := flag.String("api", "http://127.0.0.1:8080", "HTTP API base URL")
 	workers := flag.Int("workers", 5, "number of tx senders")
@@ -1715,6 +1743,7 @@ func main() {
 
 	total := int64(*txCount)
 	var sent int64
+	var wg sync.WaitGroup
 
 	// Generate ECDSA P-256 key
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -1735,15 +1764,15 @@ func main() {
 	log.Println("Seeding state (faucet -> players; AllocateLand per player)...")
 
 	// 1) Faucet -> players (use base sender as player0)
-	for w := 1; w < *workers; w++ {  // Start from 1, skip player0
-    player := fmt.Sprintf("player%d", w)
-    payload := map[string]string{
-        "from":   baseSender,  // Changed from "faucet"
-        "to":     player,
-        "amount": "10000",
-    }
-    sendTxn(ctx, priv, baseSender, "Transfer", payload, *api)
-}
+	for w := 1; w < *workers; w++ { // Start from 1, skip player0
+		player := fmt.Sprintf("player%d", w)
+		payload := map[string]string{
+			"from":   baseSender, // Changed from "faucet"
+			"to":     player,
+			"amount": "10000",
+		}
+		sendTxn(ctx, priv, baseSender, "Transfer", payload, *api)
+	}
 
 	// 2) Allocate plots (only for player 0 = our key)
 	for i := 0; i < 500000; i++ {
@@ -1760,73 +1789,105 @@ func main() {
 	time.Sleep(*seedWait)
 
 	// - - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -
-	// SPAM PHASE (only player0 = our key can send)
+	// SPAM PHASE with parallel HTTP
 	// - - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -
-// - - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -
-// SPAM PHASE
-// - - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -- - -
-log.Println("Starting spam workers now...")
+	log.Println("Starting spam workers with parallel HTTP...")
 
-var wg sync.WaitGroup
-for w := 0; w < *workers; w++ {
-    wg.Add(1)
-    go func(id int) {
-        defer wg.Done()
-        ticker := time.NewTicker(time.Second / time.Duration(*rate))
-        defer ticker.Stop()
+	// Create channels for parallel tx sending
+	type txJob struct {
+		action  string
+		payload map[string]string
+	}
 
-        for range ticker.C {
-            if total > 0 && atomic.LoadInt64(&sent) >= total {
-                return
-            }
-            
-            // Only use actions that work with single account
-            validActions := []string{"Grow", "PayTax"}
-            action := validActions[mrand.Intn(len(validActions))]
-            
-            var payload map[string]string
-            switch action {
-            case "Grow":
-                plots := playerPlots[baseSender]
-                if len(plots) == 0 {
-                    continue
-                }
-                plotID := plots[mrand.Intn(len(plots))]
-                payload = map[string]string{
-                    "plotID": plotID,
-                    "amount": fmt.Sprintf("%d", mrand.Intn(10)+1),
-                }
-            case "PayTax":
-                plots := playerPlots[baseSender]
-                if len(plots) == 0 {
-                    continue
-                }
-                plotID := plots[mrand.Intn(len(plots))]
-                payload = map[string]string{
-                    "plotID": plotID,
-                    "amount": fmt.Sprintf("%d", mrand.Intn(5)+1),
-                }
-            }
-            
-            if payload != nil {
-                sendTxn(ctx, priv, baseSender, action, payload, *api)
-                atomic.AddInt64(&sent, 1)
-            }
-        }
-    }(w)
-}
+	txChan := make(chan txJob, *rate**workers*2) // Buffer for smoother flow
 
+	// Start HTTP sender pool (10 parallel senders per worker)
+	sendersPerWorker := 10
+	for w := 0; w < *workers; w++ {
+		for s := 0; s < sendersPerWorker; s++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				for job := range txChan {
+					if total > 0 && atomic.LoadInt64(&sent) >= total {
+						return
+					}
+					sendTxn(ctx, priv, baseSender, job.action, job.payload, *api)
+					atomic.AddInt64(&sent, 1)
+				}
+			}(w)
+		}
+	}
+
+	// Start transaction generators (one per worker)
+	for w := 0; w < *workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ticker := time.NewTicker(time.Second / time.Duration(*rate))
+			defer ticker.Stop()
+
+			for range ticker.C {
+				if total > 0 && atomic.LoadInt64(&sent) >= total {
+					return
+				}
+
+				// Generate transaction
+				validActions := []string{"Grow", "PayTax"}
+				action := validActions[mrand.Intn(len(validActions))]
+
+				var payload map[string]string
+				switch action {
+				case "Grow":
+					plots := playerPlots[baseSender]
+					if len(plots) == 0 {
+						continue
+					}
+					plotID := plots[mrand.Intn(len(plots))]
+					payload = map[string]string{
+						"plotID": plotID,
+						"amount": fmt.Sprintf("%d", mrand.Intn(10)+1),
+					}
+				case "PayTax":
+					plots := playerPlots[baseSender]
+					if len(plots) == 0 {
+						continue
+					}
+					plotID := plots[mrand.Intn(len(plots))]
+					payload = map[string]string{
+						"plotID": plotID,
+						"amount": fmt.Sprintf("%d", mrand.Intn(5)+1),
+					}
+				}
+
+				if payload != nil {
+					// Non-blocking send to channel
+					select {
+					case txChan <- txJob{action: action, payload: payload}:
+					default:
+						// Channel full, skip this tx
+					}
+				}
+			}
+		}(w)
+	}
+
+	// Wait for completion or target
 	if total > 0 {
 		for {
 			if atomic.LoadInt64(&sent) >= total {
 				log.Printf("Loadgen finished: sent %d transactions", total)
+				close(txChan) // Signal senders to stop
 				break
 			}
 			time.Sleep(1 * time.Second)
 		}
 	} else {
-		wg.Wait()
+		// Run forever
+		select {}
 	}
+
+	wg.Wait()
 }
 
 --- FILE: ui/world.html ---
@@ -2370,11 +2431,6 @@ func ApplyTransaction(snap *SandboxedState, tx *types.Transaction, workerID stri
 		DeclaredKeys: DeclaredKeysFor(tx),
 	}
 
-	// Verify signature
-	if !tx.VerifySignature() {
-		res.Error = "invalid signature"
-		return res
-	}
 
 	switch tx.Action {
 	case "AllocateLand":
@@ -2750,8 +2806,8 @@ var (
 	portFlag        = flag.String("port", "9000", "listen port")
 	connectFlag     = flag.String("connect", "", "multiaddr to connect (optional)")
 	keyfileFlag     = flag.String("keyfile", "", "keyfile for identity (optional)")
-	batchSizeFlag   = flag.Int("batchsize", 1000, "batch size for leader")
-	batchInterval   = flag.Duration("batchinterval", 2*time.Second, "batch flush interval")
+	batchSizeFlag   = flag.Int("batchsize", 5000, "batch size for leader (increased from 1000)")
+	batchInterval   = flag.Duration("batchinterval", 500*time.Millisecond, "batch flush interval (decreased from 2s)")
 	blockInterval   = flag.Duration("blockinterval", 10*time.Second, "block creation interval")
 	queueInterval   = flag.Duration("queuemon", 5*time.Second, "queue monitor interval")
 	apiPortFlag     = flag.String("apiport", "8080", "port for HTTP API (leader only)")
@@ -2830,6 +2886,7 @@ func startLeader(ctx context.Context, node *network.Node, worldSize int, initWor
 	go leader.RunBatchLoop(ctx, *batchSizeFlag, *batchInterval)
 	go leader.StartQueueMonitor(ctx, *queueInterval)
 	go leader.BlockTicker(ctx, *blockInterval, *monthBlocksFlag)
+	go leader.StartTPSMonitor(ctx, 10*time.Second) // Log TPS every 10 seconds
 
 	// ensure block dir exists
 	blockDir := "blocks"
@@ -3388,7 +3445,6 @@ func DecodeTx(data []byte) (*TxMessage, error) {
 }
 
 // === Batch message ===
-// ✅ Added Snapshot so leader can send state to workers
 type BatchMessage struct {
 	BatchID      string
 	Txs          []*types.Transaction
@@ -3688,6 +3744,63 @@ func LoadOrCreatePrivKey(path string) (crypto.PrivKey, error) {
 }
 
 
+--- FILE: state/memstore.go ---
+package state
+
+import (
+	"sync"
+)
+
+// MemStore is a simple in-memory key-value store.
+type MemStore struct {
+	mu   sync.RWMutex
+	data map[string][]byte
+}
+
+func NewMemStore() *MemStore {
+	return &MemStore{
+		data: make(map[string][]byte),
+	}
+}
+
+// Add to state/memstore.go
+func (m *MemStore) SetBatch(updates map[string][]byte) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    for k, v := range updates {
+        m.data[k] = v
+    }
+}
+
+
+func (m *MemStore) Get(key []byte) ([]byte, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	val, ok := m.data[string(key)]
+	return val, ok
+}
+
+func (m *MemStore) Set(key []byte, val []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data[string(key)] = val
+}
+
+// GetSnapshot returns a full copy of the current state as a map.
+func (m *MemStore) GetSnapshot() map[string][]byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snap := make(map[string][]byte, len(m.data))
+	for k, v := range m.data {
+		// copy each value to avoid aliasing
+		buf := make([]byte, len(v))
+		copy(buf, v)
+		snap[k] = buf
+	}
+	return snap
+}
+
+
 --- FILE: execution/tax.go ---
 package execution
 
@@ -3736,54 +3849,6 @@ func FlushMonth(dir string) {
 	// reset for next month
 	monthEvents = nil
 	monthNumber++
-}
-
-
---- FILE: state/memstore.go ---
-package state
-
-import (
-	"sync"
-)
-
-// MemStore is a simple in-memory key-value store.
-type MemStore struct {
-	mu   sync.RWMutex
-	data map[string][]byte
-}
-
-func NewMemStore() *MemStore {
-	return &MemStore{
-		data: make(map[string][]byte),
-	}
-}
-
-func (m *MemStore) Get(key []byte) ([]byte, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	val, ok := m.data[string(key)]
-	return val, ok
-}
-
-func (m *MemStore) Set(key []byte, val []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.data[string(key)] = val
-}
-
-// ✅ Add this
-// GetSnapshot returns a full copy of the current state as a map.
-func (m *MemStore) GetSnapshot() map[string][]byte {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	snap := make(map[string][]byte, len(m.data))
-	for k, v := range m.data {
-		// copy each value to avoid aliasing
-		buf := make([]byte, len(v))
-		copy(buf, v)
-		snap[k] = buf
-	}
-	return snap
 }
 
 

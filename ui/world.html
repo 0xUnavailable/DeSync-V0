@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>DeSync MVP</title>
+  <title>DeSync</title>
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
   <style>
     body {
@@ -60,16 +60,16 @@
   </style>
 </head>
 <body>
-  <h1>⛏️ DeSync World MVP</h1>
+  <h1>DeSync</h1>
 
   <div class="card">
-    <h3>🪪 Identity</h3>
+    <h3>Identity</h3>
     <p><strong>Sender ID:</strong> <span id="sender-id">loading...</span></p>
-    <button onclick="regenerateKey()">🔑 New Key</button>
+    <button onclick="regenerateKey()"> New Key</button>
   </div>
 
   <div class="card">
-    <h3>📜 Create Transaction</h3>
+    <h3>Create Transaction</h3>
     <label>Action</label>
     <select id="action" onchange="setPayloadExample()">
       <option value="Grow">Grow</option>
@@ -79,11 +79,11 @@
     </select>
     <label>Payload (JSON)</label>
     <textarea id="payload" rows="4">{ "to":"player1", "amount":"5" }</textarea>
-    <button onclick="submitTx()">🚀 Send</button>
+    <button onclick="submitTx()">Send</button>
   </div>
 
   <div class="card">
-    <h3>📡 Response</h3>
+    <h3>Response</h3>
     <pre id="response">No tx yet.</pre>
   </div>
 
