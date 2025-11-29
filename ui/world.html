@@ -25,6 +25,7 @@
       padding: 1rem;
       border-radius: 0;
       box-shadow: inset -4px -4px #1a1a1a, inset 4px 4px #555;
+      margin-bottom: 1rem;
     }
     label { display: block; margin-top: 0.5rem; font-size: 12px; }
     input, textarea, select {
@@ -36,6 +37,7 @@
       width: 100%;
       font-size: 12px;
       resize: none;
+      box-sizing: border-box;
     }
     button {
       margin-top: 1rem;
@@ -56,7 +58,11 @@
       font-size: 10px;
       overflow-x: auto;
       border: 2px solid #333;
+      white-space: pre-wrap;
+      word-wrap: break-word;
     }
+    .success { color: #00ff66; }
+    .error { color: #ff3366; }
   </style>
 </head>
 <body>
@@ -65,7 +71,7 @@
   <div class="card">
     <h3>Identity</h3>
     <p><strong>Sender ID:</strong> <span id="sender-id">loading...</span></p>
-    <button onclick="regenerateKey()"> New Key</button>
+    <button onclick="regenerateKey()">New Key</button>
   </div>
 
   <div class="card">
@@ -79,15 +85,18 @@
     </select>
     <label>Payload (JSON)</label>
     <textarea id="payload" rows="4">{ "to":"player1", "amount":"5" }</textarea>
-    <button onclick="submitTx()">Send</button>
+    <button onclick="submitTx()">Send Transaction</button>
   </div>
 
   <div class="card">
     <h3>Response</h3>
-    <pre id="response">No tx yet.</pre>
+    <pre id="response">No transaction submitted yet.</pre>
   </div>
 
 <script>
+// === Configuration ===
+const API_URL = "http://localhost:8080"; // Your Go API server
+
 // === Signing Utils ===
 function bufToBase64(b){ return btoa(String.fromCharCode(...new Uint8Array(b))); }
 function base64ToBuf(s){ const bin=atob(s); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i); return arr.buffer; }
@@ -106,6 +115,7 @@ async function generateKeypairAndStore(){
   const jwk=await crypto.subtle.exportKey('jwk',kp.privateKey);
   localStorage.setItem(KEY_LS,JSON.stringify({spki:bufToBase64(spki),priv:jwk}));
 }
+
 async function loadKeypair(){
   const raw=localStorage.getItem(KEY_LS); if(!raw)return null;
   const parsed=JSON.parse(raw);
@@ -113,10 +123,12 @@ async function loadKeypair(){
   const pub=await crypto.subtle.importKey('spki',base64ToBuf(parsed.spki),{name:'ECDSA',namedCurve:'P-256'},true,['verify']);
   return {spki:parsed.spki,priv,pub};
 }
+
 async function getSenderID(){
   const kp=await loadKeypair(); if(!kp)return null;
   const h=await sha256Bytes(base64ToBuf(kp.spki)); return hexEncodeBytes(h);
 }
+
 async function signTx(tx){
   const kp=await loadKeypair();
   const str=canonicalize({sender:tx.sender,nonce:tx.nonce,action:tx.action,payload:tx.payload||{}});
@@ -125,7 +137,7 @@ async function signTx(tx){
   return {sig:bufToBase64(sig),pub:kp.spki};
 }
 
-// === UI ===
+// === UI Functions ===
 async function refreshSender(){ 
   let id=await getSenderID(); 
   if(!id){ 
@@ -133,7 +145,15 @@ async function refreshSender(){
     id=await getSenderID(); 
   }
   document.getElementById('sender-id').innerText=id;
-  setPayloadExample(); // Set default payload after sender is loaded
+  setPayloadExample();
+}
+
+async function regenerateKey() {
+  if (confirm('This will generate a new keypair. Your old identity will be lost. Continue?')) {
+    await generateKeypairAndStore();
+    await refreshSender();
+    document.getElementById('response').innerHTML = '<span class="success">New keypair generated!</span>';
+  }
 }
 
 function setPayloadExample(){
@@ -164,15 +184,38 @@ async function submitTx(){
     console.log('TX before signing:', JSON.stringify(tx));
     
     const sig=await signTx(tx);
-    const body={ID:"",Sender:tx.sender,Nonce:tx.nonce,Action:tx.action,Payload:tx.payload,PubKey:sig.pub,Sig:sig.sig};
+    const body={
+      ID:"",
+      Sender:tx.sender,
+      Nonce:tx.nonce,
+      Action:tx.action,
+      Payload:tx.payload,
+      PubKey:sig.pub,
+      Sig:sig.sig
+    };
     
     console.log('Body being sent:', JSON.stringify(body));
     
-    const res=await fetch("/tx",{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    // Post to the Go API server
+    const res=await fetch(`${API_URL}/tx`, {
+      method:"POST",
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)
+    });
+    
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+    }
+    
     const out=await res.text();
-    document.getElementById('response').innerText=out;
-  }catch(e){ document.getElementById('response').innerText="Error: "+e; }
+    document.getElementById('response').innerHTML = `<span class="success">${out}</span>`;
+  } catch(e) { 
+    console.error('Transaction error:', e);
+    document.getElementById('response').innerHTML = `<span class="error">Error: ${e.message}</span>`;
+  }
 }
+
+// Initialize on page load
 refreshSender();
 </script>
 </body>

@@ -18,7 +18,7 @@ list:
 	@echo "  loadgen       - Run libp2p-based load generator (100k tx)"
 	@echo "  loadgen_http  - Run HTTP-based load generator (100k tx)"
 	@echo "  inspect       - Inspect committed blocks in ./blocks"
-	@echo "  demo          - Launch leader, 3 workers, and HTTP loadgen"
+	//@echo "  demo          - Launch leader, 3 workers, and HTTP loadgen"
 	@echo "  get-leader-id - Get the leader's peer ID from running process"
 	@echo "  clean         - Remove blocks/ and *.key files"
 
@@ -222,41 +222,41 @@ loadgen_http:
 		--api=http://127.0.0.1:8080 \
 		--workers=10 \
 		--rate=1000 \
-		--txcount=100000
+		--txcount=1000 // Reduced to 1k for quicker testing
 
 # Inspect committed blocks
 inspect:
 	go run ./cmd/inspect --dir=blocks
 
-# Demo target (leader + 3 workers + HTTP loadgen + frontend)
-demo:
-	@echo ">>> Starting leader in background..."
-	@LEADER_LOG=leader.log && \
-	(go run ./cmd/node \
-	  --role=leader \
-	  --id=leader1 \
-	  --port=9000 \
-	  --keyfile=leader1.key \
-	  --batchsize=1000 \
-	  --batchinterval=2s \
-	  --blockinterval=10s \
-	  --queuemon=5s \
-	  --apiport=8080 \
-	  --monthblocks=10 \
-	  --staticdir=ui \
-	  --worldsize=12 \
-	  --initworld=false > $$LEADER_LOG 2>&1 & echo $$! > leader.pid)
-	@sleep 3
-	@LEADER_ID=$$(grep "peer ID" leader.log | tail -1 | awk '{print $$7}' | sed 's/,//') && \
-	echo ">>> Leader started with ID=$$LEADER_ID" && \
-	echo ">>> Starting 3 workers..." && \
-	(go run ./cmd/node --role=worker --id=worker1 --port=9001 --keyfile=worker1.key --connect=/ip4/127.0.0.1/tcp/9000/p2p/$$LEADER_ID & \
-	 go run ./cmd/node --role=worker --id=worker2 --port=9002 --keyfile=worker2.key --connect=/ip4/127.0.0.1/tcp/9000/p2p/$$LEADER_ID & \
-	 go run ./cmd/node --role=worker --id=worker3 --port=9003 --keyfile=worker3.key --connect=/ip4/127.0.0.1/tcp/9000/p2p/$$LEADER_ID &)
-	@sleep 5
-	@echo ">>> Running HTTP loadgen..."
-	go run ./cmd/loadgen_http --api=http://127.0.0.1:8080 --workers=10 --rate=1000 --txcount=100000
-	@echo ">>> Open Explorer at: http://127.0.0.1:8080/explorer.html"
+# # Demo target (leader + 3 workers + HTTP loadgen + frontend) 
+# demo:
+# 	@echo ">>> Starting leader in background..."
+# 	@LEADER_LOG=leader.log && \
+# 	(go run ./cmd/node \
+# 	  --role=leader \
+# 	  --id=leader1 \
+# 	  --port=9000 \
+# 	  --keyfile=leader1.key \
+# 	  --batchsize=1000 \
+# 	  --batchinterval=2s \
+# 	  --blockinterval=10s \
+# 	  --queuemon=5s \
+# 	  --apiport=8080 \
+# 	  --monthblocks=10 \
+# 	  --staticdir=ui \
+# 	  --worldsize=12 \
+# 	  --initworld=false > $$LEADER_LOG 2>&1 & echo $$! > leader.pid)
+# 	@sleep 3
+# 	@LEADER_ID=$$(grep "peer ID" leader.log | tail -1 | awk '{print $$7}' | sed 's/,//') && \
+# 	echo ">>> Leader started with ID=$$LEADER_ID" && \
+# 	echo ">>> Starting 3 workers..." && \
+# 	(go run ./cmd/node --role=worker --id=worker1 --port=9001 --keyfile=worker1.key --connect=/ip4/127.0.0.1/tcp/9000/p2p/$$LEADER_ID & \
+# 	 go run ./cmd/node --role=worker --id=worker2 --port=9002 --keyfile=worker2.key --connect=/ip4/127.0.0.1/tcp/9000/p2p/$$LEADER_ID & \
+# 	 go run ./cmd/node --role=worker --id=worker3 --port=9003 --keyfile=worker3.key --connect=/ip4/127.0.0.1/tcp/9000/p2p/$$LEADER_ID &)
+# 	@sleep 5
+# 	@echo ">>> Running HTTP loadgen..."
+# 	go run ./cmd/loadgen_http --api=http://127.0.0.1:8080 --workers=10 --rate=1000 --txcount=100000
+# 	@echo ">>> Open Explorer at: http://127.0.0.1:8080/explorer.html"
 
 # Clean build artifacts
 clean:

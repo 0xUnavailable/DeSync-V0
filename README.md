@@ -94,9 +94,9 @@ make leader STATICDIR=ui
 
 Then open in your browser:
 
-```
-http://localhost:8080/explorer.html
-```
+
+`http://localhost:8080/explorer.html`
+
 
 Features:
 
@@ -119,16 +119,9 @@ Run `make list` to see available targets. Key commands include:
 - `make loadgen` — Run libp2p-based load generator (100k transactions).
 - `make loadgen_http` — Run HTTP-based load generator (100k transactions).
 - `make inspect` — Inspect committed blocks in `./blocks`.
-- `make demo` — Launch leader, three workers, HTTP loadgen, and serve Explorer UI.
 - `make get-leader-id` — Get the leader's peer ID from running process.
 - `make clean` — Remove blocks, keys, logs, and PID files.
 
-### Running the Demo
-The `demo` target starts a full setup:
-```bash
-make demo
-```
-This launches the leader in background with logs to `leader.log`, discovers the leader ID, starts three workers, runs the HTTP load generator, and serves the Explorer UI at `http://localhost:8080/explorer.html`.
 
 ### Worker Setup
 Workers require the leader's peer ID. Either:

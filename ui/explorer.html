@@ -35,18 +35,12 @@
       font-weight: bold;
       color: #0f0;
     }
-    .peers-list {
-      background: #1a1a1a;
+    .error {
+      background: #4a1a1a;
+      border-left: 3px solid #f33;
       padding: 10px;
+      margin: 10px 0;
       border-radius: 4px;
-      max-height: 150px;
-      overflow-y: auto;
-    }
-    .peer-item {
-      padding: 5px;
-      margin: 3px 0;
-      background: #252525;
-      border-radius: 3px;
       font-family: monospace;
       font-size: 12px;
     }
@@ -59,6 +53,7 @@
       word-break: break-all;
       white-space: pre-wrap;
       max-width: 300px;
+      font-size: 12px;
     }
     th { background: #333; }
     tr:nth-child(even) { background: #1a1a1a; }
@@ -68,12 +63,15 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 10px;
     }
     .controls input {
       padding: 4px;
       border: 1px solid #444;
       background: #111;
       color: #eee;
+      flex: 1;
+      max-width: 300px;
     }
     .controls button {
       padding: 4px 8px;
@@ -81,10 +79,23 @@
       border: none;
       color: #eee;
       cursor: pointer;
+      border-radius: 3px;
+    }
+    .controls button:hover {
+      background: #444;
     }
     .controls button:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+    }
+    .debug-info {
+      background: #1a2a3a;
+      padding: 10px;
+      margin: 10px 0;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 11px;
+      color: #aaf;
     }
   </style>
 </head>
@@ -92,12 +103,13 @@
   <h1>DeSync Explorer</h1>
 
   <div class="section">
-    <h2>Status</h2>
+    <h2>Connection Status</h2>
+    <div id="debug-info" class="debug-info">Initializing...</div>
+  </div>
+
+  <div class="section">
+    <h2>Node Status</h2>
     <div class="metrics">
-      <!-- <div class="metric-card">
-        <h3>TPS (10s avg)</h3>
-        <div class="value" id="tps">0</div>
-      </div> -->
       <div class="metric-card">
         <h3>Total Blocks</h3>
         <div class="value" id="block-count">0</div>
@@ -114,19 +126,13 @@
     <div id="status"><p>Loading...</p></div>
   </div>
 
-  <!-- <div class="section">
-    <h2>Connected Peers</h2>
-    <div id="peers" class="peers-list"><p>Loading...</p></div>
-  </div> -->
-
   <div class="section">
     <h2>World State</h2>
     <div class="controls">
-      <input type="text" id="search-world" placeholder="Search plots..."
-        oninput="renderTable('world', window.worldState, 10, this.value, 'world')">
+      <input type="text" id="search-world" placeholder="Search plots..." />
       <div>
         <button id="prev-world" onclick="changePage('world', -1)">Prev</button>
-        <span id="page-world"></span>
+        <span id="page-world">Page 1 / 1</span>
         <button id="next-world" onclick="changePage('world', 1)">Next</button>
       </div>
     </div>
@@ -136,11 +142,10 @@
   <div class="section">
     <h2>Latest Block</h2>
     <div class="controls">
-      <input type="text" id="search-block" placeholder="Search block txs..."
-        oninput="renderTable('block', window.latestBlockTxs, 10, this.value, 'block')">
+      <input type="text" id="search-block" placeholder="Search block txs..." />
       <div>
         <button id="prev-block" onclick="changePage('block', -1)">Prev</button>
-        <span id="page-block"></span>
+        <span id="page-block">Page 1 / 1</span>
         <button id="next-block" onclick="changePage('block', 1)">Next</button>
       </div>
     </div>
@@ -150,11 +155,10 @@
   <div class="section">
     <h2>All Transactions</h2>
     <div class="controls">
-      <input type="text" id="search-txs" placeholder="Search all txs..."
-        oninput="renderTable('txs', window.allTxs, 10, this.value, 'txs')">
+      <input type="text" id="search-txs" placeholder="Search all txs..." />
       <div>
         <button id="prev-txs" onclick="changePage('txs', -1)">Prev</button>
-        <span id="page-txs"></span>
+        <span id="page-txs">Page 1 / 1</span>
         <button id="next-txs" onclick="changePage('txs', 1)">Next</button>
       </div>
     </div>
@@ -162,13 +166,12 @@
   </div>
 
   <div class="section">
-    <h2>Tax Events (Latest Month Summary)</h2>
+    <h2>Tax Events (Latest Month)</h2>
     <div class="controls">
-      <input type="text" id="search-tax" placeholder="Search tax events..."
-        oninput="renderTable('tax', window.taxEvents, 10, this.value, 'tax')">
+      <input type="text" id="search-tax" placeholder="Search tax events..." />
       <div>
         <button id="prev-tax" onclick="changePage('tax', -1)">Prev</button>
-        <span id="page-tax"></span>
+        <span id="page-tax">Page 1 / 1</span>
         <button id="next-tax" onclick="changePage('tax', 1)">Next</button>
       </div>
     </div>
@@ -178,141 +181,147 @@
   <script>
     const API = "http://localhost:8080";
     const state = {
-      world: { page: 1 },
-      block: { page: 1 },
-      txs: { page: 1 },
-      tax: { page: 1 }
+      world: { page: 1, data: [] },
+      block: { page: 1, data: [] },
+      txs: { page: 1, data: [] },
+      tax: { page: 1, data: [] }
     };
 
-    let lastTxCount = 0;
-    let lastTimestamp = Date.now();
+    let debugLog = [];
+
+    function log(msg, data = null) {
+      const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
+      const logEntry = `[${timestamp}] ${msg}`;
+      debugLog.push(logEntry);
+      if (data) {
+        console.log(msg, data);
+        debugLog.push(JSON.stringify(data, null, 2).substring(0, 500));
+      } else {
+        console.log(msg);
+      }
+      
+      // Keep only last 20 entries
+      if (debugLog.length > 20) debugLog.shift();
+      
+      const debugEl = document.getElementById("debug-info");
+      if (debugEl) {
+        debugEl.textContent = debugLog.slice(-10).join('\n');
+      }
+    }
 
     async function fetchJSON(url) {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return await res.json();
+      log(`Fetching: ${url}`);
+      try {
+        const res = await fetch(url);
+        log(`Response status: ${res.status}`);
+        
+        if (!res.ok) {
+          const text = await res.text();
+          log(`Error response: ${text}`);
+          throw new Error(`HTTP ${res.status}: ${text}`);
+        }
+        
+        const data = await res.json();
+        log(`Received data:`, data);
+        return data;
+      } catch (err) {
+        log(`Fetch error: ${err.message}`);
+        throw err;
+      }
     }
 
     async function loadStatus() {
       try {
         const st = await fetchJSON(`${API}/status`);
         
-        // Update metrics
         document.getElementById("block-count").textContent = st.block_count || 0;
         document.getElementById("state-keys").textContent = st.state_keys || 0;
         document.getElementById("role").textContent = st.role || "unknown";
         
         document.getElementById("status").innerHTML = `
-          <p><strong>Peer ID:</strong> ${st.peer_id}</p>
-          <p><strong>Ready:</strong> ${st.ready}</p>
-          <p><strong>API Version:</strong> ${st.api_version}</p>
+          <p><strong>Peer ID:</strong> ${st.peer_id || 'N/A'}</p>
+          <p><strong>Ready:</strong> ${st.ready || false}</p>
+          <p><strong>API Version:</strong> ${st.api_version || 'N/A'}</p>
         `;
+        log("Status loaded successfully");
       } catch (err) {
-        document.getElementById("status").innerHTML = `<p>Error: ${err}</p>`;
-      }
-    }
-
-    async function loadPeers() {
-      try {
-        // Note: You'll need to add a /peers endpoint in your Go API
-        // For now, we'll show a placeholder
-        const peers = []; // await fetchJSON(`${API}/peers`);
-        
-        if (peers.length === 0) {
-          document.getElementById("peers").innerHTML = 
-            `<p style="color: #888;">Peer discovery endpoint not implemented. Add GET /peers to api/server.go</p>`;
-        } else {
-          let html = '';
-          peers.forEach(p => {
-            html += `<div class="peer-item">${p.id} - ${p.role || 'unknown'}</div>`;
-          });
-          document.getElementById("peers").innerHTML = html;
-        }
-      } catch (err) {
-        document.getElementById("peers").innerHTML = `<p>Error loading peers</p>`;
-      }
-    }
-
-    async function calculateTPS() {
-      try {
-        const txs = await fetchJSON(`${API}/txs/all`);
-        const currentTxCount = txs.length;
-        const now = Date.now();
-        
-        if (lastTxCount > 0) {
-          const txDelta = currentTxCount - lastTxCount;
-          const timeDelta = (now - lastTimestamp) / 1000; // seconds
-          const tps = txDelta / timeDelta;
-          document.getElementById("tps").textContent = tps.toFixed(2);
-        }
-        
-        lastTxCount = currentTxCount;
-        lastTimestamp = now;
-      } catch (err) {
-        document.getElementById("tps").textContent = "0";
+        document.getElementById("status").innerHTML = `<div class="error">Error: ${err.message}</div>`;
+        log(`Status error: ${err.message}`);
       }
     }
 
     async function loadWorldState() {
       try {
         const plots = await fetchJSON(`${API}/state/world`);
-        window.worldState = plots || [];
+        log(`World state received: ${plots ? plots.length : 0} items`);
+        
+        state.world.data = plots || [];
         state.world.page = 1;
-        renderTable("world", window.worldState, 10,
-          document.getElementById("search-world").value, "world");
+        renderTable("world");
       } catch (err) {
-        document.getElementById("world").innerHTML = `<p>Error: ${err}</p>`;
+        document.getElementById("world").innerHTML = `<div class="error">Error: ${err.message}</div>`;
+        log(`World state error: ${err.message}`);
       }
     }
 
     async function loadLatestBlock() {
       try {
         const block = await fetchJSON(`${API}/blocks/latest`);
-        window.latestBlockTxs = block.txs || [];
+        log(`Latest block received:`, block);
+        
+        state.block.data = block.txs || [];
         state.block.page = 1;
-        renderTable("block", window.latestBlockTxs, 10,
-          document.getElementById("search-block").value, "block");
+        renderTable("block");
       } catch (err) {
-        document.getElementById("block").innerHTML = `<p>Error: ${err}</p>`;
+        document.getElementById("block").innerHTML = `<div class="error">Error: ${err.message}</div>`;
+        log(`Latest block error: ${err.message}`);
       }
     }
 
     async function loadAllTxs() {
       try {
         const txs = await fetchJSON(`${API}/txs/all`);
-        window.allTxs = txs || [];
+        log(`All transactions received: ${txs ? txs.length : 0} items`);
+        
+        state.txs.data = txs || [];
         state.txs.page = 1;
-        renderTable("txs", window.allTxs, 10,
-          document.getElementById("search-txs").value, "txs");
+        renderTable("txs");
       } catch (err) {
-        document.getElementById("txs").innerHTML = `<p>Error: ${err}</p>`;
+        document.getElementById("txs").innerHTML = `<div class="error">Error: ${err.message}</div>`;
+        log(`All transactions error: ${err.message}`);
       }
     }
 
     async function loadTaxEvents() {
       try {
         const latest = await fetchJSON(`${API}/months/latest`);
-        window.taxEvents = Array.isArray(latest) ? latest : [latest];
+        log(`Tax events received:`, latest);
+        
+        state.tax.data = Array.isArray(latest) ? latest : (latest ? [latest] : []);
         state.tax.page = 1;
-        renderTable("tax", window.taxEvents, 10,
-          document.getElementById("search-tax").value, "tax");
+        renderTable("tax");
       } catch (err) {
-        document.getElementById("tax").innerHTML = `<p>Error: ${err}</p>`;
+        document.getElementById("tax").innerHTML = `<div class="error">Error: ${err.message}</div>`;
+        log(`Tax events error: ${err.message}`);
       }
     }
 
-    function renderTable(id, rows, limit, query = "", key) {
-      const el = document.getElementById(id);
+    function renderTable(key) {
+      const el = document.getElementById(key);
+      const rows = state[key].data;
+      const query = document.getElementById(`search-${key}`).value.toLowerCase();
+      const limit = 10;
+      
       if (!rows || rows.length === 0) {
-        el.innerHTML = "<p>No data</p>";
+        el.innerHTML = "<p>No data available</p>";
+        updatePagination(key, 0, 0);
         return;
       }
 
       let filtered = rows;
       if (query) {
-        const q = query.toLowerCase();
         filtered = rows.filter(r =>
-          Object.values(r).some(v => String(v).toLowerCase().includes(q))
+          Object.values(r).some(v => String(v).toLowerCase().includes(query))
         );
       }
 
@@ -320,53 +329,72 @@
       const start = (page - 1) * limit;
       const pageRows = filtered.slice(start, start + limit);
 
-      const keys = Object.keys(pageRows[0] || {});
+      if (pageRows.length === 0) {
+        el.innerHTML = "<p>No matching results</p>";
+        updatePagination(key, filtered.length, 0);
+        return;
+      }
+
+      const keys = Object.keys(pageRows[0]);
       let html = "<table><thead><tr>";
       for (let k of keys) html += `<th>${k}</th>`;
       html += "</tr></thead><tbody>";
+      
       for (let row of pageRows) {
         html += "<tr>";
         for (let k of keys) {
           let v = row[k];
-          if (typeof v === "object") v = JSON.stringify(v);
-          html += `<td>${v}</td>`;
+          if (typeof v === "object" && v !== null) {
+            v = JSON.stringify(v);
+          }
+          html += `<td>${v === null || v === undefined ? '-' : v}</td>`;
         }
         html += "</tr>";
       }
       html += "</tbody></table>";
       el.innerHTML = html;
 
-      const totalPages = Math.ceil(filtered.length / limit) || 1;
-      document.getElementById(`page-${id}`).textContent = `Page ${page} / ${totalPages}`;
-      document.getElementById(`prev-${id}`).disabled = page <= 1;
-      document.getElementById(`next-${id}`).disabled = page >= totalPages;
+      updatePagination(key, filtered.length, limit);
+    }
+
+    function updatePagination(key, totalItems, limit) {
+      const totalPages = limit > 0 ? Math.ceil(totalItems / limit) : 1;
+      const page = state[key].page;
+      
+      document.getElementById(`page-${key}`).textContent = `Page ${page} / ${totalPages}`;
+      document.getElementById(`prev-${key}`).disabled = page <= 1;
+      document.getElementById(`next-${key}`).disabled = page >= totalPages || totalPages === 0;
     }
 
     function changePage(key, delta) {
-      state[key].page += delta;
-      const rows = key === "world"
-        ? window.worldState
-        : key === "block"
-        ? window.latestBlockTxs
-        : key === "txs"
-        ? window.allTxs
-        : window.taxEvents;
-      const query = document.getElementById(`search-${key}`).value;
-      renderTable(key, rows, 10, query, key);
+      state[key].page = Math.max(1, state[key].page + delta);
+      renderTable(key);
     }
 
+    // Add event listeners for search inputs
+    ['world', 'block', 'txs', 'tax'].forEach(key => {
+      document.getElementById(`search-${key}`).addEventListener('input', () => {
+        state[key].page = 1;
+        renderTable(key);
+      });
+    });
+
     async function refresh() {
+      log("Starting refresh...");
       await loadStatus();
-      await loadPeers();
-      await calculateTPS();
       await loadWorldState();
       await loadLatestBlock();
       await loadAllTxs();
       await loadTaxEvents();
+      log("Refresh complete");
     }
 
-    setInterval(refresh, 10000);
+    // Initial load
+    log("DeSync Explorer initialized");
     refresh();
+    
+    // Auto-refresh every 10 seconds
+    setInterval(refresh, 10000);
   </script>
 </body>
 </html>
